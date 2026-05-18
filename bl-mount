@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# bl-mount — FUSE-T streaming unlock + mount (no 128 GB image materialized).
+#
+# Prereqs:
+#   1. brew install --cask fuse-t   (one-time, needs sudo + GUI approval)
+#   2. ./build.sh fuse              (rebuilds dislocker with -DWITH_FUSE=ON)
+#
+# Usage:
+#   ./bl-mount                # auto-detect first BitLocker drive
+#   ./bl-mount /dev/disk7s1   # explicit device
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BL="$SCRIPT_DIR/bl"
+
+[[ -x "$BL" ]] || { echo "error: $BL missing or not executable" >&2; exit 1; }
+
+# State variables used by cleanup_all.
+SECRET_FILE=""
+
+# ---------------------------------------------------------------------------
+# F3-02 fix: comprehensive cleanup registered on all exit paths.
+# ---------------------------------------------------------------------------
+cleanup_all() {
+  [[ -n "${SECRET_FILE:-}" ]] && rm -f "$SECRET_FILE"
+  sudo -k 2>/dev/null  # invalidate cached sudo creds explicitly
+}
+trap 'cleanup_all' EXIT INT TERM ERR
+
+DEVICE="${1:-}"
+if [[ -z "$DEVICE" ]]; then
+  DEVICE=$("$BL" detect --json | python3 -c "
+import json, sys
+drives = json.load(sys.stdin)
+locked = [d for d in drives if d['isBitLocker'] and d['isLocked']]
+if not locked:
+    sys.stderr.write('no locked BitLocker drives found\n')
+    sys.exit(1)
+if len(locked) > 1:
+    sys.stderr.write('multiple BitLocker drives found — pass /dev/diskNsN explicitly:\n')
+    for d in locked:
+        sys.stderr.write(f\"  {d['device']}  {d['name']}  ({d['sizeBytes']} B)\n\")
+    sys.exit(1)
+print(locked[0]['device'])
+")
+  [[ -n "$DEVICE" ]] || exit 1
+  echo "Detected BitLocker drive: $DEVICE"
+fi
+
+# ---------------------------------------------------------------------------
+# F1-01 fix: collect secret and pass via a mode-0600 temp file, not argv.
+# ---------------------------------------------------------------------------
+read -rsp "BitLocker password (or 48-digit recovery key): " PASS
+echo
+
+SECRET_FILE="$(mktemp -t bl-secret.XXXXXXXX)"
+chmod 600 "$SECRET_FILE"
+printf '%s' "$PASS" > "$SECRET_FILE"
+
+if [[ "$PASS" =~ ^[0-9]{6}(-[0-9]{6}){7}$ ]]; then
+  SECRET_TYPE="recovery"
+else
+  SECRET_TYPE="password"
+fi
+
+# Wipe PASS from shell memory immediately — the secret is now in the file.
+unset PASS
+
+exec "$BL" mount --secret-file "$SECRET_FILE" --secret-type "$SECRET_TYPE" --device "$DEVICE"

@@ -1,0 +1,27 @@
+/build/
+/CMakeFiles/
+/CMakeCache.txt
+/*.cmake
+/Makefile
+/*.log
+/Testing/
+*.swp
+*.DS_Store
+/.claude/settings.local.json
+/third_party/dislocker/build/
+/tmp/
+
+# Swift build artefacts
+/BitLockerUnlock/.build/
+/BitLockerUnlock/Package.resolved
+
+# Built .app bundle + sibling manifest (regeneratable via make-app.sh)
+/BitLockerUnlock/BitLockerUnlock.app/
+/BitLockerUnlock/BitLockerUnlock.app.MANIFEST.sha256
+
+# Icon generation scratch (icon.iconset is auto-deleted but be defensive)
+/BitLockerUnlock/icon.iconset/
+
+# Secret files (defense-in-depth: should never persist outside /tmp anyway)
+bl-secret.*
+bl-secret-*

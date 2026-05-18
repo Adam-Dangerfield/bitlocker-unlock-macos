@@ -1,0 +1,28 @@
+name: macOS CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Homebrew dependencies
+        run: |
+          brew install cmake openssl@3
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_PREFIX_PATH="$(brew --prefix openssl@3)"
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure

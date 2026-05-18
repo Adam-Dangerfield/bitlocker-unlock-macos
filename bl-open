@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# bl-open — unlock a BitLocker USB volume and mount its plaintext, in one go.
+#
+# Usage:
+#   ./bl-open                  # defaults to /dev/disk7s1
+#   ./bl-open /dev/disk7s1
+#   ./bl-open -f key.BEK       # use BEK file instead of password
+#
+# Behaviour:
+#   - Prompts for your BitLocker password (or recovery key) once.
+#   - sudo will also prompt for your macOS login password (raw disk access).
+#   - Auto-detects: 48-digit "######-######-..." -> recovery key,
+#                   anything else                  -> user password.
+#   - Live progress bar while decrypting (polls image file size).
+#   - Skips re-decryption if /tmp/bl/decrypted.img already exists.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISLOCKER="$SCRIPT_DIR/third_party/dislocker/build/src/dislocker-file"
+IMG_DIR="/tmp/bl"
+IMG="$IMG_DIR/decrypted.img"
+LOG="$IMG_DIR/dislocker.log"
+
+# State variables used by cleanup_all.
+KEEP_SUDO=""
+DPID=""
+SECRET_FILE=""
+
+# ---------------------------------------------------------------------------
+# F3-02 fix: comprehensive cleanup registered on all exit paths.
+# ---------------------------------------------------------------------------
+cleanup_all() {
+  [[ -n "${DPID:-}" ]] && kill -0 "$DPID" 2>/dev/null && sudo kill "$DPID" 2>/dev/null || true
+  [[ -n "${KEEP_SUDO:-}" ]] && kill "$KEEP_SUDO" 2>/dev/null || true
+  [[ -n "${SECRET_FILE:-}" ]] && rm -f "$SECRET_FILE"
+  sudo -k 2>/dev/null  # invalidate cached sudo creds explicitly
+}
+trap 'cleanup_all' EXIT INT TERM ERR
+
+# ---------------------------------------------------------------------------
+# F5-01 fix: symlink-safe directory creation.
+# ---------------------------------------------------------------------------
+safe_mkdir() {
+  local dir="$1"
+  if [[ -L "$dir" ]]; then
+    echo "error: $dir is a symlink — refusing to use (TOCTOU risk)" >&2
+    exit 1
+  fi
+  if [[ -e "$dir" && ! -d "$dir" ]]; then
+    echo "error: $dir exists and is not a directory" >&2
+    exit 1
+  fi
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  # post-mkdir check: re-verify it wasn't swapped to a symlink
+  if [[ -L "$dir" ]]; then
+    echo "error: $dir became a symlink during mkdir" >&2
+    exit 1
+  fi
+}
+
+DEVICE="/dev/disk7s1"
+BEK_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--bekfile) BEK_FILE="$2"; shift 2 ;;
+    /dev/*)       DEVICE="$1"; shift ;;
+    -h|--help)    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)            echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -x "$DISLOCKER" ]] || { echo "error: dislocker-file not built at $DISLOCKER" >&2; exit 1; }
+[[ -b "$DEVICE" || -c "$DEVICE" ]] || { echo "error: $DEVICE is not a block/char device" >&2; exit 1; }
+
+safe_mkdir "$IMG_DIR"
+
+# Human-readable byte formatting (BSD-awk safe).
+human() {
+  awk -v b="$1" 'BEGIN {
+    split("B KB MB GB TB", u)
+    i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf (i == 1) ? "%d %s" : "%.1f %s", b, u[i]
+  }'
+}
+
+# Render a progress bar in-place. $1=done $2=total $3=rate-bytes-per-sec
+render_bar() {
+  local done=$1 total=$2 rate=$3
+  local width=36
+  local pct=0 filled=0 eta="--"
+  (( total > 0 )) && pct=$(( done * 100 / total ))
+  (( pct > 100 )) && pct=100
+  filled=$(( pct * width / 100 ))
+  local bar
+  bar=$(printf '%*s' "$filled" '' | tr ' ' '#')
+  bar+=$(printf '%*s' $((width - filled)) '' | tr ' ' '-')
+  if (( rate > 0 )); then
+    local secs=$(( (total - done) / rate ))
+    (( secs < 0 )) && secs=0
+    eta=$(printf '%dm%02ds' $((secs / 60)) $((secs % 60)))
+  fi
+  printf '\r[%s] %3d%%  %s / %s  %s/s  ETA %s    ' \
+    "$bar" "$pct" "$(human "$done")" "$(human "$total")" "$(human "$rate")" "$eta"
+}
+
+# Watch the image grow while dislocker runs in background.
+# $1=PID of dislocker  $2=total bytes
+monitor_progress() {
+  local pid=$1 total=$2
+  local samples=()        # last N (timestamp,bytes) for rolling rate
+  local window=5          # seconds
+  while kill -0 "$pid" 2>/dev/null; do
+    local now cur
+    now=$(date +%s)
+    cur=0
+    [[ -f "$IMG" ]] && cur=$(stat -f %z "$IMG" 2>/dev/null || echo 0)
+
+    samples+=("$now:$cur")
+    # Drop samples older than $window seconds
+    local cutoff=$(( now - window ))
+    local kept=()
+    local s
+    for s in "${samples[@]}"; do
+      [[ ${s%%:*} -ge $cutoff ]] && kept+=("$s")
+    done
+    samples=("${kept[@]}")
+
+    local rate=0
+    if (( ${#samples[@]} >= 2 )); then
+      local first=${samples[0]} last=${samples[-1]}
+      local dt=$(( ${last%%:*} - ${first%%:*} ))
+      local db=$(( ${last##*:} - ${first##*:} ))
+      (( dt > 0 )) && rate=$(( db / dt ))
+    fi
+
+    render_bar "$cur" "$total" "$rate"
+    sleep 1
+  done
+  # Final paint at 100%
+  render_bar "$total" "$total" 0
+  echo
+}
+
+# ---- Resolve total bytes for the device ----
+TOTAL=$(diskutil info "$DEVICE" | awk -F'[()]' '/Disk Size:/ { print $2; exit }' | awk '{print $1}')
+[[ "$TOTAL" =~ ^[0-9]+$ ]] || { echo "error: could not parse device size from diskutil" >&2; exit 1; }
+
+# ---- Decrypt (or skip if image exists) ----
+if [[ -s "$IMG" ]]; then
+  echo "Found existing decrypted image at $IMG ($(human "$(stat -f %z "$IMG")")) — skipping decrypt."
+  echo "(delete it and re-run if you want a fresh decrypt.)"
+else
+  if [[ -n "$BEK_FILE" ]]; then
+    [[ -r "$BEK_FILE" ]] || { echo "error: cannot read BEK file $BEK_FILE" >&2; exit 1; }
+    AUTH_ARGS=(-f "$BEK_FILE")
+    KIND="BEK file"
+  else
+    read -rsp "BitLocker password (or 48-digit recovery key): " PASS
+    echo
+
+    # ---------------------------------------------------------------------------
+    # F1-01 fix: write secret to a mode-0600 temp file; never pass via argv.
+    # ---------------------------------------------------------------------------
+    SECRET_FILE="$(mktemp -t bl-secret.XXXXXXXX)"
+    chmod 600 "$SECRET_FILE"
+    printf '%s' "$PASS" > "$SECRET_FILE"
+
+    if [[ "$PASS" =~ ^[0-9]{6}(-[0-9]{6}){7}$ ]]; then
+      SECRET_TYPE="recovery"
+      KIND="recovery key"
+    else
+      SECRET_TYPE="password"
+      KIND="user password"
+    fi
+
+    # Wipe PASS from shell memory immediately — the secret is now in the file.
+    unset PASS
+
+    AUTH_ARGS=(--secret-file "$SECRET_FILE" --secret-type "$SECRET_TYPE")
+  fi
+
+  echo "Decrypting $DEVICE with $KIND -> $IMG ($(human "$TOTAL"))"
+  echo "Authorising sudo (raw disk access)..."
+  sudo -v
+
+  # Keep sudo timestamp alive for long decrypts.
+  ( while kill -0 "$$" 2>/dev/null; do sudo -nv 2>/dev/null; sleep 60; done ) &
+  KEEP_SUDO=$!
+
+  rm -f "$LOG"
+  sudo "$DISLOCKER" -V "$DEVICE" "${AUTH_ARGS[@]}" -- "$IMG" >"$LOG" 2>&1 &
+  DPID=$!
+  unset AUTH_ARGS
+
+  monitor_progress "$DPID" "$TOTAL"
+  wait "$DPID"
+  rc=$?
+
+  if (( rc != 0 )); then
+    echo "dislocker-file failed (exit $rc). Last 20 log lines:" >&2
+    tail -20 "$LOG" >&2
+    exit "$rc"
+  fi
+fi
+
+echo "Attaching plaintext image..."
+# dislocker-file ran as root, so the image is root-owned and hdiutil attach
+# (which we run as the user) would fail with EACCES. Reclaim ownership first.
+if [[ "$(stat -f %u "$IMG")" != "$(id -u)" ]]; then
+  sudo chown "$(id -u):$(id -g)" "$IMG"
+fi
+hdiutil attach "$IMG"
+
+echo
+echo "Done. To clean up later:"
+echo "  hdiutil detach <mount-point-shown-above>"
+echo "  rm $IMG     # optional, frees ~128 GB"

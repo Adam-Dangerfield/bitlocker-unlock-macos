@@ -1,0 +1,3 @@
+[submodule "third_party/dislocker"]
+	path = third_party/dislocker
+	url = https://github.com/Aorimn/dislocker.git

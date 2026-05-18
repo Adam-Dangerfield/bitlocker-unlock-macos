@@ -1,0 +1,1057 @@
+#!/usr/bin/env python3
+"""bl — BitLocker-on-macOS control plane.
+
+Subcommands (JSON-friendly for UI wiring):
+  bl detect [--json]
+        List candidate BitLocker drives.
+        JSON: [{device, name, sizeBytes, isBitLocker, isLocked, mountPoint, filesystem}]
+
+  bl unlock --device DEV (--password P | --recovery R | --bek FILE
+                          | --secret-file PATH --secret-type {password|recovery|bek})
+                          [--out PATH] [--json]
+        Decrypt-to-image. Streams progress (NDJSON if --json):
+          {progress: 0..1, bytesDone, bytesTotal, etaSec, ratePerSec}
+        Final line:
+          {mountPath: "..."} on success, {error: code, message: "..."} on failure.
+
+  bl mount  --device DEV (--password P | --recovery R | --bek FILE
+                          | --secret-file PATH --secret-type {password|recovery|bek})
+                          [--json]
+        FUSE-T streaming mount. Requires fuse-t + a dislocker built with -DWITH_FUSE=ON.
+        Final JSON: {mountPath: "..."} or {error: ...}.
+
+  bl eject   --mount PATH [--json]
+        Detach an hdiutil-mounted plaintext image.
+
+  bl cleanup --image PATH [--json]
+        Delete a cached decrypted image. Safe-guards against paths outside /tmp/bl.
+
+All subcommands accept --json for machine-readable output and exit non-zero on error.
+Human-readable mode (default) prints concise progress for terminal use.
+
+SECURITY NOTES (see docs/security/sections for full details):
+
+  Secret transport: prefer ``--secret-file PATH --secret-type {password|recovery|bek}``
+  for any non-interactive invocation. The file is opened O_NOFOLLOW, read into
+  memory, and unlinked before the secret is used. The secret never appears in
+  this process's argv nor in the child dislocker's argv: passwords/recovery
+  keys are written to dislocker over a pty so dislocker sees only a "tty"
+  prompt. BEK files are passed via -f (path only, no transformation).
+
+  The legacy ``--password`` / ``--recovery`` CLI flags still work for
+  interactive CLI use but emit a deprecation warning — they are visible in
+  ``ps aux``. ``--bek`` is fine because only the file path is on argv.
+
+  The dislocker subprocess MUST NOT be invoked with ``-v`` — that raises
+  verbosity to a level where dislocker prints plaintext credentials to its
+  stdout (which we capture into ``/tmp/bl/dislocker.log``). The
+  ``_assert_no_verbose`` helper below enforces this at call sites; do not
+  remove it without auditing dislocker's L_DEBUG/L_INFO emissions.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import errno
+import fcntl
+import getpass
+import json
+import os
+import plistlib
+import pty
+import re
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+import warnings
+from pathlib import Path
+from typing import NoReturn, Optional
+
+SCRIPT_DIR     = Path(__file__).resolve().parent
+PROJECT_ROOT   = SCRIPT_DIR
+# BL_DISLOCKER_DIR lets the host app (e.g. the SwiftUI BitLockerUnlock.app)
+# point us at a bundled copy of the dislocker binaries, sidestepping macOS
+# TCC restrictions on reading files outside the app's bundle.
+_DEFAULT_DISLOCKER_DIR = PROJECT_ROOT / "third_party" / "dislocker" / "build" / "src"
+DISLOCKER_DIR  = Path(os.environ.get("BL_DISLOCKER_DIR", str(_DEFAULT_DISLOCKER_DIR)))
+DISLOCKER_FILE = DISLOCKER_DIR / "dislocker-file"
+DISLOCKER_FUSE = DISLOCKER_DIR / "dislocker-fuse"
+IMG_DIR        = Path("/tmp/bl")
+DEFAULT_IMAGE  = IMG_DIR / "decrypted.img"
+FUSE_DIR       = IMG_DIR / "fuse"
+LOG_FILE       = IMG_DIR / "dislocker.log"
+
+# Match BitLocker recovery key shape: 8 groups of 6 digits.
+RECOVERY_RE = re.compile(r"^\d{6}(-\d{6}){7}$")
+
+# Reasonable subset of external bus protocols for USB drives.
+EXTERNAL_BUSES = {"USB", "FireWire", "Thunderbolt", "SD"}
+
+# Sudo-keepalive backstop. The child exits voluntarily after this many seconds
+# even if the parent is still alive — defence in depth against a parent that
+# is stuck or has lost track of the keepalive.
+KEEPALIVE_MAX_SECONDS = 30 * 60
+
+
+# ---------- output helpers ----------
+
+def emit(obj, *, json_mode: bool, stream: bool = False) -> None:
+    """Write a JSON record (one per line) or human text.
+
+    ``stream=True`` is honoured only for progress-style records — it forces
+    NDJSON-style streaming output when ``json_mode`` is on (one compact line
+    per call). In text mode it routes progress records through the bar.
+    """
+    if json_mode:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        return
+    if isinstance(obj, dict) and "progress" in obj:
+        bar_width = 32
+        pct = int(obj["progress"] * 100)
+        filled = pct * bar_width // 100
+        bar = "#" * filled + "-" * (bar_width - filled)
+        eta = obj.get("etaSec")
+        eta_str = "--" if eta is None else f"{eta // 60}m{eta % 60:02d}s"
+        rate = obj.get("ratePerSec", 0)
+        sys.stdout.write(
+            f"\r[{bar}] {pct:3d}%  {human(obj['bytesDone'])} / "
+            f"{human(obj['bytesTotal'])}  {human(rate)}/s  ETA {eta_str}    "
+        )
+        sys.stdout.flush()
+    elif isinstance(obj, dict) and "mountPath" in obj:
+        sys.stdout.write(f"\nmounted at {obj['mountPath']}\n")
+    elif isinstance(obj, dict) and "error" in obj:
+        sys.stderr.write(f"\nerror ({obj['error']}): {obj.get('message', '')}\n")
+    else:
+        sys.stdout.write(json.dumps(obj, indent=2) + "\n")
+
+
+def human(n) -> str:
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or u == "TB":
+            return f"{int(n)} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def fail(code: str, message: str, *, json_mode: bool, exit_code: int = 1) -> NoReturn:
+    emit({"error": code, "message": message}, json_mode=json_mode)
+    sys.exit(exit_code)
+
+
+def warn_stderr(msg: str) -> None:
+    """Best-effort stderr warning; never raises."""
+    try:
+        sys.stderr.write(f"WARN: {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+# ---------- /tmp/bl safe-dir helpers (F5-01) ----------
+
+def _ensure_safe_dir(path: Path, *, json_mode: bool) -> None:
+    """Create ``path`` and verify it's a real, sanely-owned directory.
+
+    Refuses to proceed if:
+      * the path is a symlink (pre-emption attack)
+      * the path is not a directory
+      * the path is owned by another user and we're not root
+
+    F5-01 / F5-04: addresses pre-run symlink attacks on ``/tmp/bl``.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except FileExistsError:
+        # Race: another process created it between exists check and mkdir.
+        pass
+    except OSError as e:
+        fail("UNSAFE_DIR", f"cannot create {path}: {e}", json_mode=json_mode)
+
+    # Re-check on each call: defends against directory swap mid-session.
+    if os.path.islink(str(path)):
+        fail("UNSAFE_DIR",
+             f"{path} is a symlink — refusing (possible pre-emption attack)",
+             json_mode=json_mode)
+    try:
+        st = os.stat(str(path), follow_symlinks=False)
+    except OSError as e:
+        fail("UNSAFE_DIR", f"cannot stat {path}: {e}", json_mode=json_mode)
+
+    import stat as _stat
+    if not _stat.S_ISDIR(st.st_mode):
+        fail("UNSAFE_DIR", f"{path} exists but is not a directory", json_mode=json_mode)
+
+    euid = os.geteuid()
+    if euid != 0 and st.st_uid != euid:
+        fail("UNSAFE_DIR",
+             f"{path} owned by uid={st.st_uid}, expected uid={euid} — refusing",
+             json_mode=json_mode)
+
+    # Tighten mode if too permissive (don't lower to 000 — we still need rwx).
+    if (st.st_mode & 0o077) != 0:
+        try:
+            os.chmod(str(path), 0o700)
+        except OSError:
+            pass
+
+
+def _safe_under(path: Path, root: Path) -> bool:
+    """True iff ``path`` (after realpath) lies inside ``root`` (after realpath)."""
+    try:
+        target = Path(os.path.realpath(str(path)))
+        safe_root = Path(os.path.realpath(str(root)))
+    except OSError:
+        return False
+    if target == safe_root:
+        return True
+    return safe_root in target.parents
+
+
+# ---------- diskutil ----------
+
+def diskutil_plist(*args: str) -> dict:
+    # `-plist` must appear immediately after the subcommand (before the device
+    # operand for `diskutil info`), so we inject it at position 1.
+    cmd, *rest = args
+    raw = subprocess.check_output(["diskutil", cmd, "-plist", *rest])
+    return plistlib.loads(raw)
+
+
+def detect_drives() -> list[dict]:
+    """Enumerate external partitions and flag BitLocker candidates."""
+    top = diskutil_plist("list")
+    drives: list[dict] = []
+    for entry in top.get("AllDisksAndPartitions", []):
+        parts = entry.get("Partitions", [])
+        # Whole-disk-only (no partitions) also possible; include if external+NTFS.
+        candidates = parts if parts else [entry]
+        for part in candidates:
+            ident = part.get("DeviceIdentifier")
+            if not ident:
+                continue
+            info = inspect_partition(f"/dev/{ident}")
+            if info:
+                drives.append(info)
+    return drives
+
+
+def inspect_partition(device: str) -> Optional[dict]:
+    try:
+        p = diskutil_plist("info", device)
+    except subprocess.CalledProcessError:
+        return None
+    bus = p.get("BusProtocol", "")
+    if bus not in EXTERNAL_BUSES:
+        return None
+    content   = p.get("Content", "")
+    fs_user   = p.get("FilesystemUserVisibleName", "")
+    fs_pers   = p.get("FilesystemPersonality", "")
+    mount_pt  = p.get("MountPoint", "") or ""
+    size      = int(p.get("TotalSize", 0) or 0)
+    # `name` priority: volume label, then media name, then identifier.
+    name = (p.get("VolumeName") or p.get("MediaName") or p.get("DeviceIdentifier") or "").strip()
+
+    # BitLocker partitions present as Windows_NTFS (partition type byte 0x07)
+    # and refuse to mount natively. Once unlocked, we serve a plaintext image
+    # separately — so the source partition itself never gets a MountPoint.
+    is_bl = content == "Windows_NTFS" and not mount_pt
+    return {
+        "device":      device,
+        "name":        name,
+        "sizeBytes":   size,
+        "isBitLocker": is_bl,
+        "isLocked":    is_bl,
+        "mountPoint":  mount_pt,
+        "filesystem":  fs_user or fs_pers,
+        "bus":         bus,
+    }
+
+
+# ---------- secret resolution (F1-01, F2-01) ----------
+
+class Secret:
+    """A resolved BitLocker credential.
+
+    Attributes:
+        kind: 'password', 'recovery', or 'bek'
+        value: for password/recovery, the secret bytes (rstrip'd of CR/LF only;
+               internal whitespace preserved). For 'bek', None.
+        bek_path: for 'bek', the path string. For others, None.
+    """
+    __slots__ = ("kind", "value", "bek_path")
+
+    def __init__(self, kind: str, value: Optional[bytes] = None,
+                 bek_path: Optional[str] = None) -> None:
+        self.kind = kind
+        self.value = value
+        self.bek_path = bek_path
+
+
+def _read_secret_file(path: str, *, json_mode: bool) -> bytes:
+    """Read a secret file with anti-symlink defences, then unlink it.
+
+    Per the secret-transport protocol:
+      1. open O_RDONLY | O_NOFOLLOW (refuse symlinks)
+      2. read full content
+      3. ALWAYS unlink in try/finally (defence in depth even if sender
+         deletes it too)
+      4. return raw bytes; caller does the rstrip+decode
+    """
+    fd = -1
+    try:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.EMLINK):
+                fail("UNSAFE_SECRET_FILE",
+                     f"secret file is a symlink: {path}",
+                     json_mode=json_mode, exit_code=2)
+            fail("UNSAFE_SECRET_FILE",
+                 f"cannot open secret file {path}: {e}",
+                 json_mode=json_mode, exit_code=2)
+
+        # Defensive size cap — secrets should never be megabytes.
+        chunks: list[bytes] = []
+        remaining = 64 * 1024
+        while remaining > 0:
+            buf = os.read(fd, min(4096, remaining))
+            if not buf:
+                break
+            chunks.append(buf)
+            remaining -= len(buf)
+        return b"".join(chunks)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        # Defence in depth: always unlink even if the sender promises to.
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            warn_stderr(f"could not unlink secret file {path}: {e}")
+
+
+def _decode_secret(raw: bytes, *, json_mode: bool) -> str:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("BAD_SECRET",
+             "secret is not valid UTF-8",
+             json_mode=json_mode, exit_code=2)
+    # Strip ONLY trailing CR/LF — passwords may contain internal whitespace.
+    return text.rstrip("\r\n")
+
+
+def _validate_recovery(value: str, *, json_mode: bool) -> None:
+    """F2-01: enforce RECOVERY_RE on recovery keys from any source."""
+    if not RECOVERY_RE.match(value):
+        fail("BAD_RECOVERY",
+             "recovery key must be 8 groups of 6 digits separated by '-' "
+             "(e.g. 123456-123456-...)",
+             json_mode=json_mode, exit_code=2)
+
+
+def resolve_secret(args, *, json_mode: bool) -> Secret:
+    """Resolve the user's chosen auth method into a Secret object.
+
+    Order of precedence:
+      1. --secret-file + --secret-type (recommended; out-of-band)
+      2. --bek (path only is on argv — safe)
+      3. --password / --recovery (deprecated; warns)
+      4. interactive prompt (fallback)
+    """
+    # 1. Out-of-band secret file (preferred).
+    if getattr(args, "secret_file", None):
+        if not getattr(args, "secret_type", None):
+            fail("BAD_ARGS",
+                 "--secret-file requires --secret-type {password|recovery|bek}",
+                 json_mode=json_mode, exit_code=2)
+        stype = args.secret_type
+        if stype == "bek":
+            # For BEK, the "secret file" IS the BEK file's path delivered to us
+            # — but the file itself is just a path the BEK lives at on disk.
+            # Spec: bek uses -f with a regular bek file path (no secret file
+            # involved). Honour that: treat --secret-file PATH --secret-type bek
+            # as "use PATH as the bek file path directly" without unlink.
+            if not Path(args.secret_file).is_file():
+                fail("BAD_BEK",
+                     f"BEK file not readable: {args.secret_file}",
+                     json_mode=json_mode, exit_code=2)
+            return Secret(kind="bek", bek_path=args.secret_file)
+
+        raw = _read_secret_file(args.secret_file, json_mode=json_mode)
+        value = _decode_secret(raw, json_mode=json_mode)
+        if stype == "recovery":
+            _validate_recovery(value, json_mode=json_mode)
+        elif stype != "password":
+            fail("BAD_ARGS",
+                 f"unknown --secret-type: {stype}",
+                 json_mode=json_mode, exit_code=2)
+        return Secret(kind=stype, value=value.encode("utf-8"))
+
+    # 2. BEK file path on argv (safe — only the path is exposed).
+    if getattr(args, "bek", None):
+        if not Path(args.bek).is_file():
+            fail("BAD_BEK",
+                 f"BEK file not readable: {args.bek}",
+                 json_mode=json_mode, exit_code=2)
+        return Secret(kind="bek", bek_path=args.bek)
+
+    # 3. Recovery on argv (deprecated).
+    if getattr(args, "recovery", None) is not None:
+        warn_stderr(
+            "--recovery on the command line is visible via `ps aux`. "
+            "Use --secret-file PATH --secret-type recovery for non-interactive use."
+        )
+        _validate_recovery(args.recovery, json_mode=json_mode)
+        return Secret(kind="recovery", value=args.recovery.encode("utf-8"))
+
+    # 3. Password on argv (deprecated).
+    if getattr(args, "password", None) is not None:
+        warn_stderr(
+            "--password on the command line is visible via `ps aux`. "
+            "Use --secret-file PATH --secret-type password for non-interactive use."
+        )
+        return Secret(kind="password", value=args.password.encode("utf-8"))
+
+    # 4. Interactive prompt.
+    secret = getpass.getpass("BitLocker password (or 48-digit recovery key): ")
+    if RECOVERY_RE.match(secret):
+        return Secret(kind="recovery", value=secret.encode("utf-8"))
+    return Secret(kind="password", value=secret.encode("utf-8"))
+
+
+# ---------- dislocker invocation guards ----------
+
+def _assert_no_verbose(argv: list[str]) -> None:
+    """F6-02: refuse to spawn dislocker with any -v flag.
+
+    At L_DEBUG / L_INFO verbosity, dislocker prints the plaintext password and
+    recovery key to its stdout — which we redirect to /tmp/bl/dislocker.log
+    and can surface in error messages. This guard is the lint-grep target:
+    if you remove it you MUST first audit and remove the dis_printf(L_DEBUG,
+    "Using the user password: '%s'") calls in
+    third_party/dislocker/src/accesses/user_pass/user_pass.c and friends.
+    """
+    for a in argv:
+        # Allow the unrelated `-V <volume>` and `-VV`-style nothing-else.
+        if a == "-v" or (a.startswith("-v") and not a.startswith("-V")):
+            # `-v` is the verbosity bump; `-V` is the volume path.
+            raise AssertionError(
+                "refusing to spawn dislocker with verbose flag — would leak "
+                "credentials into the log (F6-02)"
+            )
+
+
+# ---------- sudo keepalive (F3-01) ----------
+
+class SudoKeepalive:
+    """Context manager that keeps the sudo timestamp warm and *always* cleans up.
+
+    Replaces the previous bare ``os.fork()`` loop which leaked the keepalive
+    child on most exit paths (F3-01). The child also has a hard upper bound of
+    ``KEEPALIVE_MAX_SECONDS`` as a backstop in case the parent crashes without
+    ever sending SIGTERM (PID-recycle race).
+    """
+
+    def __init__(self) -> None:
+        self.pid: Optional[int] = None
+
+    def __enter__(self) -> "SudoKeepalive":
+        # Prime the timestamp interactively first.
+        subprocess.check_call(["sudo", "-v"])
+        parent = os.getpid()
+        pid = os.fork()
+        if pid == 0:
+            # --- child ---
+            # Reset signal handlers so the child can be SIGTERM'd cleanly.
+            signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+            signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+            try:
+                start = time.monotonic()
+                while time.monotonic() - start < KEEPALIVE_MAX_SECONDS:
+                    # Detect parent gone via getppid (becomes 1 when reparented).
+                    if os.getppid() != parent:
+                        os._exit(0)
+                    try:
+                        os.kill(parent, 0)
+                    except ProcessLookupError:
+                        os._exit(0)
+                    subprocess.call(
+                        ["sudo", "-nv"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    time.sleep(60)
+            except Exception:
+                pass
+            os._exit(0)
+
+        # --- parent ---
+        self.pid = pid
+        # Belt and braces: register cleanup at process exit too.
+        atexit.register(self._cleanup)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        pid = self.pid
+        if pid is None:
+            return
+        self.pid = None
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+        # Wait up to ~2s for graceful exit, then SIGKILL.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                done, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if done == pid:
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+
+# ---------- safe chown via /dev/fd (F5-02) ----------
+
+def _safe_chown_to_self(path: Path, *, json_mode: bool) -> None:
+    """Take ownership of ``path`` without following symlinks.
+
+    F5-02: the previous code did ``path.stat().st_uid`` then
+    ``sudo chown <uid:gid> <str(path)>`` — a textbook TOCTOU. An attacker
+    racing to swap the path for a symlink between the two calls could redirect
+    ``chown`` to an arbitrary file.
+
+    Fix: open the path with ``O_NOFOLLOW`` and operate on the file descriptor.
+    macOS supports ``/dev/fd/<n>``, so we can hand the fd to a privileged
+    helper via path-form. If we're already root, skip sudo entirely (F3-04
+    least-privilege bonus).
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            fail("UNSAFE_PATH",
+                 f"{path} is a symlink — refusing to take ownership",
+                 json_mode=json_mode)
+        raise
+
+    try:
+        st = os.fstat(fd)
+        if st.st_uid == os.getuid():
+            return
+        uid = os.getuid()
+        gid = os.getgid()
+        if os.geteuid() == 0:
+            # Already root: no need to shell out to sudo.
+            os.fchown(fd, uid, gid)
+            return
+        # /dev/fd/<fd> resolves to the open file regardless of any
+        # path-level swap that happened after we opened it.
+        subprocess.check_call(
+            ["sudo", "chown", f"{uid}:{gid}", f"/dev/fd/{fd}"]
+        )
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# ---------- dislocker subprocess (pty for secret transport) ----------
+
+def _spawn_dislocker(binary: Path, dislocker_args: list[str],
+                     secret_bytes: Optional[bytes], log_fd: int,
+                     *, use_pty: bool) -> subprocess.Popen:
+    """Spawn dislocker as root with the secret transported out-of-band.
+
+    Strategy:
+      * For password / recovery, attach the slave end of a pty as stdin so
+        dislocker treats stdin as a terminal and prompts via getpass. We then
+        write ``<secret>\\n`` to the master fd. The secret never appears in
+        argv at any level.
+      * For BEK (no secret_bytes), we just pass -f with the path.
+      * stdout and stderr are wired to ``log_fd``.
+
+    Returns the Popen; the caller closes the pty master after writing.
+    """
+    _assert_no_verbose(dislocker_args)
+
+    master_fd = -1
+    slave_fd = -1
+    stdin_arg = subprocess.DEVNULL
+
+    if use_pty and secret_bytes is not None:
+        master_fd, slave_fd = pty.openpty()
+        # Turn echo OFF on the slave so the secret bytes we write to master
+        # are not echoed back into our read buffer (and never reach the log).
+        try:
+            attrs = termios.tcgetattr(slave_fd)
+            # lflag is index 3
+            attrs[3] = attrs[3] & ~termios.ECHO
+            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+        except termios.error:
+            pass
+        stdin_arg = slave_fd  # type: ignore[assignment]
+
+    # close_fds=True is the default in Py3; we explicitly pass the log fd via
+    # stdout/stderr=log_fd and the slave pty via stdin.
+    proc = subprocess.Popen(
+        ["sudo", "-n", str(binary), *dislocker_args],
+        stdin=stdin_arg,
+        stdout=log_fd,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+        pass_fds=(master_fd,) if master_fd >= 0 else (),
+    )
+
+    # Parent doesn't need the slave end any more.
+    if slave_fd >= 0:
+        try:
+            os.close(slave_fd)
+        except OSError:
+            pass
+
+    # Write the secret to the master, then close it so dislocker sees EOF.
+    if master_fd >= 0 and secret_bytes is not None:
+        try:
+            payload = secret_bytes + b"\n"
+            # Best-effort write; the child may not yet be reading.
+            view = memoryview(payload)
+            while view:
+                # Non-blocking-ish: poll for writability with a small timeout.
+                try:
+                    _, w, _ = select.select([], [master_fd], [], 5.0)
+                except OSError:
+                    break
+                if not w:
+                    break
+                try:
+                    n = os.write(master_fd, view)
+                except OSError as e:
+                    if e.errno in (errno.EAGAIN, errno.EINTR):
+                        continue
+                    break
+                if n <= 0:
+                    break
+                view = view[n:]
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+
+    return proc
+
+
+def _build_dislocker_args(secret: Secret, device: str, *,
+                          tail: list[str]) -> list[str]:
+    """Build dislocker's argv WITHOUT inlining any secret value.
+
+    Returns the args after ``binary`` and before the ``--`` mountpoint/file:
+    e.g. ``["-V", "/dev/disk7s1", "-p", "--", "/tmp/bl/decrypted.img"]``.
+    """
+    base = ["-V", device]
+    if secret.kind == "bek":
+        # bek: pass the path — no secret involved on argv.
+        if not secret.bek_path:
+            raise AssertionError("bek secret missing path")
+        base += ["-f", secret.bek_path]
+    elif secret.kind == "recovery":
+        # -p with NO inline value: dislocker prompts on the pty.
+        base += ["-p"]
+    elif secret.kind == "password":
+        # -u with NO inline value: dislocker prompts on the pty.
+        base += ["-u"]
+    else:
+        raise AssertionError(f"unknown secret kind: {secret.kind}")
+    base += ["--", *tail]
+    return base
+
+
+# ---------- subcommands ----------
+
+def cmd_detect(args) -> int:
+    drives = detect_drives()
+    if args.json:
+        emit(drives, json_mode=True)
+    else:
+        if not drives:
+            print("No external drives found.")
+            return 0
+        for d in drives:
+            tag = "BitLocker" if d["isBitLocker"] else d["filesystem"] or "-"
+            mnt = f"  mounted: {d['mountPoint']}" if d["mountPoint"] else ""
+            print(f"{d['device']:<14} {human(d['sizeBytes']):>8}  [{tag}]  {d['name']}{mnt}")
+    return 0
+
+
+def cmd_unlock(args) -> int:
+    if not DISLOCKER_FILE.is_file():
+        fail("MISSING_DISLOCKER", f"{DISLOCKER_FILE} not built", json_mode=args.json)
+
+    # F2-02: --out PATH must resolve under IMG_DIR (no arbitrary root-write).
+    # Check this FIRST, before any device probing or secret prompting, so a
+    # path-traversal attempt is rejected with a clear error.
+    out_path = Path(args.out) if args.out else DEFAULT_IMAGE
+    if not _safe_under(out_path, IMG_DIR):
+        fail("UNSAFE_PATH",
+             f"--out must resolve under {IMG_DIR} (got {out_path})",
+             json_mode=args.json, exit_code=2)
+
+    secret = resolve_secret(args, json_mode=args.json)
+
+    try:
+        total = device_size(args.device)
+    except subprocess.CalledProcessError as e:
+        fail("BAD_DEVICE",
+             f"diskutil info {args.device} failed (exit {e.returncode})",
+             json_mode=args.json)
+    if total <= 0:
+        fail("BAD_DEVICE", f"could not size {args.device}", json_mode=args.json)
+
+    # F5-01: ensure /tmp/bl is a real, safely-owned dir BEFORE writing into it.
+    _ensure_safe_dir(IMG_DIR, json_mode=args.json)
+
+    # Re-check after the safety guard above.
+    _ensure_safe_dir(out_path.parent, json_mode=args.json)
+
+    # Skip-if-present.
+    if out_path.exists() and out_path.stat().st_size > 0:
+        mount_path = hdiutil_attach(out_path, json_mode=args.json)
+        emit({"mountPath": mount_path}, json_mode=args.json)
+        return 0
+
+    # Privilege escalation + log file setup. The keepalive context manager
+    # guarantees the refresher child is killed on every exit path (F3-01).
+    with SudoKeepalive():
+        # F1-05 / F5-05: open log with explicit 0600.
+        try:
+            os.unlink(str(LOG_FILE))
+        except FileNotFoundError:
+            pass
+        log_fd = os.open(
+            str(LOG_FILE),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+
+        dargs = _build_dislocker_args(secret, args.device, tail=[str(out_path)])
+        try:
+            proc = _spawn_dislocker(
+                DISLOCKER_FILE, dargs, secret.value, log_fd, use_pty=True,
+            )
+        finally:
+            # Parent no longer needs the log fd directly (the child has it).
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
+            # Zero our copy of the secret asap.
+            secret.value = None
+
+        samples: list = []
+        window = 5.0  # seconds for rate average
+
+        def handle_sigint(_sig, _frm):
+            proc.terminate()
+            raise KeyboardInterrupt()
+        signal.signal(signal.SIGINT, handle_sigint)
+
+        try:
+            while proc.poll() is None:
+                cur = out_path.stat().st_size if out_path.exists() else 0
+                now = time.monotonic()
+                samples.append((now, cur))
+                samples[:] = [s for s in samples if now - s[0] <= window]
+                if len(samples) >= 2:
+                    dt = samples[-1][0] - samples[0][0]
+                    db = samples[-1][1] - samples[0][1]
+                    rate = int(db / dt) if dt > 0 else 0
+                else:
+                    rate = 0
+                eta = int((total - cur) / rate) if rate > 0 else None
+                emit({
+                    "progress":   cur / total if total else 0.0,
+                    "bytesDone":  cur,
+                    "bytesTotal": total,
+                    "ratePerSec": rate,
+                    "etaSec":     eta,
+                }, json_mode=args.json, stream=True)
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            fail("CANCELLED", "user cancelled", json_mode=args.json)
+
+        rc = proc.wait()
+        if rc != 0:
+            # F6-01: only include log tail in non-JSON mode and behind a flag-ish
+            # gate; in JSON mode (UI path) return a short generic message.
+            try:
+                tail = Path(str(LOG_FILE)).read_text(errors="replace").splitlines()[-20:]
+            except OSError:
+                tail = []
+            short = f"dislocker-file exit {rc}"
+            full = short + ("\ntail:\n" + "\n".join(tail) if tail else "")
+            fail("DECRYPT_FAILED",
+                 short if args.json else full,
+                 json_mode=args.json)
+
+        # final 100% paint
+        emit({"progress": 1.0, "bytesDone": total, "bytesTotal": total,
+              "ratePerSec": 0, "etaSec": 0}, json_mode=args.json, stream=True)
+
+    mount_path = hdiutil_attach(out_path, json_mode=args.json)
+    emit({"mountPath": mount_path, "imagePath": str(out_path)}, json_mode=args.json)
+    return 0
+
+
+def cmd_mount(args) -> int:
+    """FUSE-T streaming mount via dislocker-fuse."""
+    if not DISLOCKER_FUSE.is_file():
+        fail("MISSING_FUSE_BUILD",
+             "dislocker-fuse not built. Install FUSE-T "
+             "(`brew install --cask fuse-t`) and rebuild dislocker with -DWITH_FUSE=ON.",
+             json_mode=args.json)
+
+    secret = resolve_secret(args, json_mode=args.json)
+
+    _ensure_safe_dir(IMG_DIR, json_mode=args.json)
+    _ensure_safe_dir(FUSE_DIR, json_mode=args.json)
+
+    with SudoKeepalive():
+        # We don't capture dislocker-fuse stdout/stderr; it stays foreground-ish.
+        # But we still need a benign sink: use the existing log file.
+        try:
+            os.unlink(str(LOG_FILE))
+        except FileNotFoundError:
+            pass
+        log_fd = os.open(
+            str(LOG_FILE),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+
+        dargs = _build_dislocker_args(secret, args.device, tail=[str(FUSE_DIR)])
+        try:
+            proc = _spawn_dislocker(
+                DISLOCKER_FUSE, dargs, secret.value, log_fd, use_pty=True,
+            )
+        finally:
+            try:
+                os.close(log_fd)
+            except OSError:
+                pass
+            secret.value = None
+
+        # Wait briefly for mount to appear
+        inner = FUSE_DIR / "dislocker-file"
+        for _ in range(40):
+            if inner.exists():
+                break
+            time.sleep(0.25)
+        else:
+            proc.terminate()
+            fail("FUSE_NOT_READY", f"dislocker-fuse did not expose {inner}", json_mode=args.json)
+
+    mount_path = hdiutil_attach(inner, json_mode=args.json)
+    emit({"mountPath": mount_path, "fuseDir": str(FUSE_DIR)}, json_mode=args.json)
+    return 0
+
+
+def cmd_eject(args) -> int:
+    rc = subprocess.call(["hdiutil", "detach", args.mount])
+    if rc != 0:
+        fail("EJECT_FAILED", f"hdiutil detach {args.mount} exit {rc}", json_mode=args.json)
+    emit({"detached": args.mount}, json_mode=args.json)
+    return 0
+
+
+def cmd_cleanup(args) -> int:
+    target = Path(args.image).resolve()
+    safe_root = IMG_DIR.resolve()
+    if safe_root not in target.parents and target != safe_root:
+        fail("UNSAFE_PATH",
+             f"refusing to delete {target} (outside {safe_root})",
+             json_mode=args.json)
+    try:
+        target.unlink()
+        emit({"deleted": str(target)}, json_mode=args.json)
+    except FileNotFoundError:
+        emit({"deleted": str(target), "note": "already absent"}, json_mode=args.json)
+    return 0
+
+
+def device_size(device: str) -> int:
+    p = diskutil_plist("info", device)
+    return int(p.get("TotalSize", 0) or 0)
+
+
+# ---------- hdiutil ----------
+
+def hdiutil_attach(path: Path, *, json_mode: bool = False) -> str:
+    """Attach a plaintext image. Returns the first /Volumes/... mount path.
+
+    Idempotent: if the image is already attached (e.g. from a prior session
+    or manual recovery), returns the existing mount point instead of erroring
+    with `Resource busy`.
+    """
+    # Already attached?
+    existing = _existing_mount_for(path)
+    if existing:
+        return existing
+
+    # dislocker-file runs as root and writes the image owned by root, which
+    # blocks hdiutil attach when invoked as a regular user. Reclaim ownership
+    # before attaching — using O_NOFOLLOW + /dev/fd to defeat TOCTOU (F5-02).
+    _safe_chown_to_self(path, json_mode=json_mode)
+
+    out = subprocess.check_output(
+        ["hdiutil", "attach", "-plist", "-nobrowse", str(path)]
+    )
+    p = plistlib.loads(out)
+    for entity in p.get("system-entities", []):
+        mp = entity.get("mount-point")
+        if mp:
+            return mp
+    # Fall back to dev-entry if nothing was mountable
+    for entity in p.get("system-entities", []):
+        if "dev-entry" in entity:
+            return entity["dev-entry"]
+    return "(attached, no mount point reported)"
+
+
+def _existing_mount_for(path: Path) -> Optional[str]:
+    """If `path` is already attached via hdiutil, return its mount point.
+
+    macOS quirk: /tmp is a symlink to /private/tmp. We compare resolved real
+    paths so the lookup works regardless of which form `hdiutil info` reports.
+    """
+    try:
+        out = subprocess.check_output(["hdiutil", "info", "-plist"])
+    except subprocess.CalledProcessError:
+        return None
+    p = plistlib.loads(out)
+    target = os.path.realpath(str(path))
+    for image in p.get("images", []):
+        img_path = image.get("image-path") or ""
+        if os.path.realpath(img_path) == target:
+            for entity in image.get("system-entities", []):
+                mp = entity.get("mount-point")
+                if mp:
+                    return mp
+    return None
+
+
+# ---------- argparse ----------
+
+def add_auth_flags(sp: argparse.ArgumentParser) -> None:
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--password", help=argparse.SUPPRESS)  # deprecated, see --help epilog
+    g.add_argument("--recovery", help=argparse.SUPPRESS)  # deprecated
+    g.add_argument("--bek", help="path to .BEK file (the file path is fine to "
+                                  "expose on argv — it's not a secret)")
+    g.add_argument("--secret-file",
+                   help="path to a file containing the secret. The file is "
+                        "opened O_NOFOLLOW, read, then unlinked. Requires "
+                        "--secret-type. PREFERRED for non-interactive use.")
+    sp.add_argument("--secret-type",
+                    choices=["password", "recovery", "bek"],
+                    help="kind of secret in --secret-file. For bek, the file "
+                         "is treated as the BEK path itself (not unlinked).")
+
+
+_DEPRECATION_EPILOG = """\
+Secret-handling notes:
+  Prefer  --secret-file PATH --secret-type {password|recovery|bek}
+  over    --password / --recovery on the command line.
+
+  --password and --recovery on the command line are visible to every local
+  user via `ps aux` for the full duration of decryption (potentially hours).
+  --bek is fine: only the file path is on argv, not the key material.
+
+  When --secret-file is used, the secret is delivered to dislocker over a pty
+  (so it never appears in dislocker's argv either). The secret file is
+  unlinked after reading, even if the sender already deleted it.
+"""
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="bl",
+        description="BitLocker-on-macOS control plane",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_DEPRECATION_EPILOG,
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_detect = sub.add_parser("detect", help="list candidate BitLocker drives")
+    p_detect.add_argument("--json", action="store_true")
+    p_detect.set_defaults(func=cmd_detect)
+
+    p_unlock = sub.add_parser(
+        "unlock", help="decrypt-to-image and attach (file path)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_DEPRECATION_EPILOG,
+    )
+    p_unlock.add_argument("--device", required=True)
+    add_auth_flags(p_unlock)
+    p_unlock.add_argument("--out",
+                          help=f"output image path (default {DEFAULT_IMAGE}); "
+                               f"MUST resolve under {IMG_DIR}")
+    p_unlock.add_argument("--json", action="store_true")
+    p_unlock.set_defaults(func=cmd_unlock)
+
+    p_mount = sub.add_parser(
+        "mount", help="FUSE-T streaming mount (no full image)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_DEPRECATION_EPILOG,
+    )
+    p_mount.add_argument("--device", required=True)
+    add_auth_flags(p_mount)
+    p_mount.add_argument("--json", action="store_true")
+    p_mount.set_defaults(func=cmd_mount)
+
+    p_eject = sub.add_parser("eject", help="detach a mounted plaintext volume")
+    p_eject.add_argument("--mount", required=True)
+    p_eject.add_argument("--json", action="store_true")
+    p_eject.set_defaults(func=cmd_eject)
+
+    p_clean = sub.add_parser("cleanup", help="delete a cached decrypted image")
+    p_clean.add_argument("--image", required=True)
+    p_clean.add_argument("--json", action="store_true")
+    p_clean.set_defaults(func=cmd_cleanup)
+
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
