@@ -1,0 +1,27 @@
+{
+  "document": "docs/security/SECURITY_REVIEW_2026-05-18.md",
+  "reviewed_at": "2026-05-18T00:00:00Z",
+  "reviewer": "claude-opus-4-7 (7 sonnet sections + 1 opus aggregation)",
+  "criteria_version": "1.0.0",
+  "scores": [
+    { "id": "C01", "name": "Accuracy",                 "score": 5, "weight": 2.0, "justification": "Every finding cites a specific file path and line number, includes a verbatim code excerpt, and maps to a CWE identifier. Pass items are similarly evidence-anchored. Two adversarial password traces are walked through every escape layer, and the threat model is honoured throughout (no out-of-scope claims about kernel-level or cryptographic primitive risks)." },
+    { "id": "C02", "name": "Completeness",             "score": 4, "weight": 1.5, "justification": "All seven specialist domains (auth, input validation, privilege, injection, filesystem, logging, supply chain) are covered with 42 distinct finding IDs; STRIDE replay covers all six categories. One soft spot: several findings overlap across sections (F1-05 and F5-05 on log mode; F3-03 and F7-06 on BL_DISLOCKER_DIR; F3-05 and F7-01 on unsigned bundle) and the aggregation surfaces this in Cross-section themes but does not formally deduplicate the count." },
+    { "id": "C03", "name": "Clarity",                  "score": 5, "weight": 1.5, "justification": "Each finding follows a consistent Evidence / CWE / Impact / Remediation structure with concrete attack scenarios. The top-priority list reads as an execution-ordered checklist. STRIDE replay and Cross-section themes give a reader-friendly entry point before the dense per-section content." },
+    { "id": "C04", "name": "Structure",                "score": 5, "weight": 1.0, "justification": "Master document follows the requested structure precisely: header, threat model, summary scorecard, top-priority list, STRIDE replay, cross-section themes, inlined sections 1-7 each with H2 anchor and horizontal rule, and a single sign-off question. Severity totals match between table, prose, and per-section verdicts." },
+    { "id": "C05", "name": "Actionability",            "score": 5, "weight": 1.5, "justification": "Every finding has a remediation block with concrete code/CLI snippets (Swift, Python, bash). The top-priority list orders fixes by foundational dependency (signing before BL_PATH_OVERRIDE, symlink guard before TOCTOU) so a developer can work it as a queue. The sign-off question names a discrete checklist whose completion moves the project from RED to YELLOW." },
+    { "id": "C06", "name": "Security Awareness",       "score": 5, "weight": 1.5, "justification": "CWE-aligned throughout; identifies attack chains (F5-01 unlocks F5-02; F7-01 amplifies F7-02 and F7-07; F3-04 amplifies F3-03); distinguishes between confirmed exploitable and latent/conditional findings (F6-02 latent on verbosity, F4-01 requires env-var control). Honours the stated out-of-scope items rather than padding the report with kernel or crypto-primitive speculation." },
+    { "id": "C07", "name": "Cost Awareness",           "score": 3, "weight": 1.0, "justification": "Process-only doc; default 3 per framework." },
+    { "id": "C08", "name": "Formatting & Presentation","score": 4, "weight": 0.5, "justification": "Markdown tables, fenced code blocks, and reference-style links render cleanly. Two minor inconsistencies inherited from per-section files: section H1 styles vary ('# Section 1:' vs '# Section 5 —' vs '# Section 7:'), and per-section verdict formats differ (table in S3/S7, list in S1/S2, prose in S4/S5/S6). The aggregator inlines these verbatim per instructions, so the inconsistency is preserved rather than corrected." }
+  ],
+  "weighted_average": 4.62,
+  "pass": true,
+  "summary": "Comprehensive, evidence-anchored review of a small macOS utility that surfaces 42 findings (5 CRITICAL, 16 HIGH, 13 MEDIUM, 8 LOW) across all seven domains; the review itself is high-quality and actionable, but the project's net security posture is RED — the .app bundle is unsigned, the BitLocker secret is ps-visible in argv at three layers, two env vars (BL_PATH_OVERRIDE, BL_DISLOCKER_DIR) directly redirect the privileged escalation path, and /tmp/bl is symlink-attackable on first run.",
+  "improvements": [
+    "Deduplicate or explicitly cross-link overlapping findings across sections (F1-05/F5-05 on log file mode, F3-03/F7-06 on BL_DISLOCKER_DIR, F3-05/F7-01 on unsigned bundle) and produce a single canonical ID with secondary references rather than two near-duplicate findings each.",
+    "Normalise per-section verdict format to a single shape (severity table) — sections currently mix table, bulleted list, and prose verdicts, which makes the aggregated scorecard derivation harder to audit.",
+    "Add a 'verified exploit' versus 'theoretical' tag to each finding — several HIGHs (F2-04 BEK TOCTOU, F5-06 predictable filename DoS) are gated on prerequisites that should be flagged so triage can prioritise demonstrable findings.",
+    "Include a one-page remediation-cost estimate (eng-days per finding tier) so the top-priority list can be turned into a sprint plan without further analysis.",
+    "Add a 'fix-validation test' suggestion per CRITICAL/HIGH finding (e.g. for F1-01: 'after fix, ps -axwww | grep dislocker-file must not contain -u or -p with a non-stdin value'), giving the developer a concrete acceptance criterion."
+  ],
+  "confirm": true
+}
