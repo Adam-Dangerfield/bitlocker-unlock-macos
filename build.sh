@@ -67,6 +67,24 @@ fi
 
 echo "dislocker pin OK: $ACTUAL_SHA"
 
+# ---------- F7-09: deterministic VERSION_DBG ----------
+# dislocker's CMakeLists bakes `git rev-parse --abbrev-ref HEAD` of the vendored
+# tree into every binary via -DVERSION_DBG (used by dislocker.c / config.c /
+# dislocker-metadata.c). On a detached HEAD that is the constant "HEAD"; on a
+# named branch it is the branch name — so a binary built from the *same* pinned
+# commit differs byte-for-byte depending on local checkout state.
+# `git submodule update` always leaves a detached HEAD, but a manual checkout
+# inside the submodule can leave a branch. Normalise it here — same commit, no
+# working-tree changes — so the build is reproducible regardless of that state.
+# (The other VERSION_DBG component, `git log -1 --pretty=%t`, is the pinned
+# commit's tree hash and is already constant. dislocker's sources use no
+# __DATE__/__TIME__ macros, so SOURCE_DATE_EPOCH is not needed.)
+if git -C "$DISLOCKER_DIR" symbolic-ref -q HEAD >/dev/null 2>&1; then
+  echo "normalising dislocker to detached HEAD (reproducible VERSION_DBG)"
+  git -C "$DISLOCKER_DIR" checkout --detach --quiet "$ACTUAL_SHA" \
+    || echo "warning: could not detach dislocker HEAD; VERSION_DBG may vary" >&2
+fi
+
 # ---------- F7-04: mbedtls@3 (required) — version must be v3.x ----------
 MBEDTLS_PREFIX="$(brew --prefix mbedtls@3 2>/dev/null || true)"
 if [[ -z "$MBEDTLS_PREFIX" ]]; then
