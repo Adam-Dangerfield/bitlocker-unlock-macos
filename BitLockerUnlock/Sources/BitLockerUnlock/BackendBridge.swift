@@ -82,13 +82,13 @@ public final class BackendBridge: @unchecked Sendable {
 
     /// `./bl unlock --device DEV ... --json`
     ///
-    /// Streams `UnlockEvent` values. Implementation note: because osascript
-    /// blocks, we cannot read NDJSON line-by-line from stdout — we get the
-    /// whole blob at the end. We bridge the gap by polling the output image
-    /// every 500ms to emit synthetic `.progress` events.
+    /// Streams `UnlockEvent` values. `bl unlock` runs UNPRIVILEGED (F3-04) and
+    /// itself elevates only its `_priv-decrypt` helper for the one root step
+    /// (dislocker reading the raw device). We capture bl's stdout as one blob
+    /// and poll the output image every 500ms to emit `.progress` events.
     ///
     /// SECURITY (F1-02): The secret is written to a 0600 temp file and passed
-    /// via `--secret-file`; it is never placed in argv or the shell command string.
+    /// via `--secret-file`; it is never placed in argv or a shell command string.
     public func unlock(
         device: String,
         method: UnlockMethod
@@ -128,13 +128,25 @@ public final class BackendBridge: @unchecked Sendable {
                     }
                 }
 
-                // Kick off the privileged osascript work in parallel with a
-                // progress-poll loop.
+                // F3-04: run `bl unlock` UNPRIVILEGED in parallel with the
+                // progress poller. bl is now an orchestrator that internally
+                // elevates only its `_priv-decrypt` helper (one osascript admin
+                // prompt) for the dislocker step. BL_ELEVATE pins bl to the GUI
+                // auth dialog rather than a (here unanswerable) terminal sudo.
                 let runTask = Task.detached { () -> (exit: Int32, stdout: String, stderr: String) in
-                    return await self.runOsascriptBL(
-                        subcommand: "unlock",
-                        extraArgs: ["--device", device] + secretArgs + ["--json"]
-                    )
+                    var env = self.blEnv()
+                    env["BL_ELEVATE"] = "osascript"
+                    do {
+                        let r = try await self.runProcess(
+                            executable: "/usr/bin/env",
+                            args: ["python3", self.blPath, "unlock", "--device", device]
+                                + secretArgs + ["--json"],
+                            extraEnv: env
+                        )
+                        return (r.exitCode, r.stdout, r.stderr)
+                    } catch {
+                        return (-1, "", "spawn error: \(error.localizedDescription)")
+                    }
                 }
 
                 // Progress poller. Emits .progress periodically until the
