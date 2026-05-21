@@ -65,6 +65,7 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import warnings
@@ -432,6 +433,77 @@ def resolve_secret(args, *, json_mode: bool) -> Secret:
     return Secret(kind="password", value=secret.encode("utf-8"))
 
 
+# ---------- BEK staging (F2-04) ----------
+
+def _unlink_quiet(path: str) -> None:
+    """Best-effort unlink; never raises."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _stage_bek(secret: Secret, *, json_mode: bool) -> None:
+    """F2-04: copy a caller-supplied BEK file into IMG_DIR before use.
+
+    ``resolve_secret`` only does an ``is_file()`` check on the BEK path; that
+    path is then handed, seconds later, to dislocker running as root. An
+    attacker with write access to the BEK's parent directory could swap the
+    file for a symlink in that window (CWE-367 TOCTOU), redirecting a
+    root-privileged read to an arbitrary file.
+
+    Staging closes the window: open the original ``O_NOFOLLOW``, copy its
+    bytes into a fresh 0600 file inside IMG_DIR — already mode 0700,
+    user-owned and symlink-guarded by ``_ensure_safe_dir`` — and repoint the
+    Secret at that copy. dislocker then opens a path nobody else can swap.
+    The copy is unlinked at process exit.
+
+    No-op for password / recovery secrets.
+    """
+    if secret.kind != "bek" or not secret.bek_path:
+        return
+
+    src = secret.bek_path
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            fail("UNSAFE_BEK", f"BEK path is a symlink: {src}",
+                 json_mode=json_mode, exit_code=2)
+        fail("BAD_BEK", f"cannot open BEK file {src}: {e}",
+             json_mode=json_mode, exit_code=2)
+
+    try:
+        import stat as _stat
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            fail("UNSAFE_BEK", f"BEK path is not a regular file: {src}",
+                 json_mode=json_mode, exit_code=2)
+        # A real BEK file is a few hundred bytes; cap hard.
+        if st.st_size > 64 * 1024:
+            fail("BAD_BEK", f"BEK file {src} is implausibly large — refusing",
+                 json_mode=json_mode, exit_code=2)
+        data = b""
+        while True:
+            buf = os.read(fd, 4096)
+            if not buf:
+                break
+            data += buf
+    finally:
+        os.close(fd)
+
+    # mkstemp creates the file mode 0600 inside the already-safe IMG_DIR.
+    dst_fd, dst_path = tempfile.mkstemp(prefix="bek-", suffix=".staged",
+                                        dir=str(IMG_DIR))
+    try:
+        os.write(dst_fd, data)
+    finally:
+        os.close(dst_fd)
+
+    atexit.register(_unlink_quiet, dst_path)
+    secret.bek_path = dst_path
+
+
 # ---------- dislocker invocation guards ----------
 
 def _assert_no_verbose(argv: list[str]) -> None:
@@ -764,6 +836,10 @@ def cmd_unlock(args) -> int:
             0o600,
         )
 
+        # F2-04: copy a caller-supplied BEK into the safe IMG_DIR before it
+        # reaches root dislocker — closes the check-vs-use race.
+        _stage_bek(secret, json_mode=args.json)
+
         dargs = _build_dislocker_args(secret, args.device, tail=[str(out_path)])
         try:
             proc = _spawn_dislocker(
@@ -858,6 +934,9 @@ def cmd_mount(args) -> int:
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
             0o600,
         )
+
+        # F2-04: stage the BEK inside the safe IMG_DIR before root dislocker.
+        _stage_bek(secret, json_mode=args.json)
 
         dargs = _build_dislocker_args(secret, args.device, tail=[str(FUSE_DIR)])
         try:
