@@ -217,4 +217,9 @@ hdiutil attach "$IMG"
 echo
 echo "Done. To clean up later:"
 echo "  hdiutil detach <mount-point-shown-above>"
-echo "  rm $IMG     # optional, frees ~128 GB"
+echo "  rm $IMG     # plaintext copy of the drive — delete when done (~128 GB)"
+echo
+# F5-08: the image is an unencrypted copy of the volume. Time Machine skips
+# /private/tmp by default, but third-party backup tools may not.
+echo "Note: $IMG is UNENCRYPTED. Exclude /private/tmp/bl from any"
+echo "      third-party backup tool so the plaintext isn't copied off-box."
