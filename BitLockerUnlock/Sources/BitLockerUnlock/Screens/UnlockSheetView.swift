@@ -21,9 +21,6 @@ struct UnlockSheetView: View {
     @State private var recoveryRaw:   String = ""   // digits only, max 48
     @State private var bekURL:        URL?   = nil
 
-    // UI-only session-remember toggle
-    @State private var rememberSession: Bool = false
-
     // MARK: Derived helpers
 
     /// Recovery key formatted as "######-######-…" with dashes every 6 digits.
@@ -128,16 +125,16 @@ struct UnlockSheetView: View {
             .padding(.top, 14)
             .animation(.easeInOut(duration: 0.2), value: mode)
 
-            // ── Divider + checkbox ───────────────────────────────────────
+            // ── Divider ──────────────────────────────────────────────────
+            // F1-08: a "Remember for this session" checkbox lived here. It was
+            // never wired to a credential store, so it falsely implied the
+            // BitLocker secret was being retained. Removed rather than left as
+            // misleading UI. Re-add only together with a Keychain-backed
+            // implementation (kSecAttrAccessibleWhenUnlockedThisDeviceOnly +
+            // .userPresence) and its own security review.
             Divider()
                 .padding(.top, 16)
                 .padding(.bottom, 12)
-
-            Toggle(isOn: $rememberSession) {
-                Text("Remember for this session")
-                    .font(.system(size: 13))
-            }
-            .toggleStyle(.checkbox)
 
             // ── Buttons ──────────────────────────────────────────────────
             HStack(spacing: 8) {
