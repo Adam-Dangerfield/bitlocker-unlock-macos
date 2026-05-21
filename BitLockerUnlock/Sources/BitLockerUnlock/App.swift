@@ -1,4 +1,24 @@
 import SwiftUI
+import AppKit
+
+/// Closes security finding **F6-03**: by default macOS allows screen-recording
+/// APIs and screen-sharing software to capture an app's windows. For a tool
+/// that displays a BitLocker password / recovery key, that's a real
+/// exfiltration path (`ScreenCaptureKit`, third-party recorders, even
+/// `screencapture -l`). Setting `sharingType = .none` removes the window
+/// from those capture surfaces. Tradeoff: legitimate screen sharing
+/// (e.g. demos, remote support) won't see this window either — acceptable
+/// for a single-purpose credential-entry tool.
+private struct WindowGuard: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async {
+            v.window?.sharingType = .none
+        }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
 
 @main
 struct BitLockerUnlockApp: App {
@@ -53,6 +73,7 @@ struct ContentView: View {
                 }
         }
         .frame(width: 520, height: 640)
+        .background(WindowGuard())
         // Sheet overlay for the credentials modal — driven directly by the
         // .unlockSheet case.
         .sheet(isPresented: Binding(
