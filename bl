@@ -744,6 +744,16 @@ def cmd_unlock(args) -> int:
     # Re-check after the safety guard above.
     _ensure_safe_dir(out_path.parent, json_mode=args.json)
 
+    # F5-06: the image path is predictable (/tmp/bl/decrypted.img). The parent
+    # dir is mode-0700 + symlink-guarded by _ensure_safe_dir, but guard the
+    # image file itself too — refuse if the predictable name is a symlink, so
+    # it can never redirect the skip-path `hdiutil attach` below nor dislocker's
+    # root-owned write into out_path.
+    if os.path.islink(str(out_path)):
+        fail("UNSAFE_PATH",
+             f"{out_path} is a symlink — refusing (possible pre-emption attack)",
+             json_mode=args.json, exit_code=2)
+
     # Skip-if-present.
     if out_path.exists() and out_path.stat().st_size > 0:
         mount_path = hdiutil_attach(out_path, json_mode=args.json)
