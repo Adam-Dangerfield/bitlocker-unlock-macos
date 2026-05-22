@@ -20,17 +20,75 @@ private struct WindowGuard: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
+/// Closes security finding **F1-06**: Path A leaves a fully decrypted,
+/// plaintext copy of the volume at `/private/tmp/bl/decrypted.img`. The eject
+/// button already deletes it (when `autoCleanupOnEject` is on), but quitting
+/// the app — Cmd-Q, or the menu-bar "Quit" — would otherwise leave both the
+/// mounted volume and that image behind, with no app left to manage them, so
+/// a later `bl unlock` could re-mount the cached plaintext with no BitLocker
+/// secret. `applicationShouldTerminate` intercepts the quit and, if a volume
+/// is still mounted, asks whether to eject and delete the image first.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    /// Wired up from `BitLockerUnlockApp` once the window appears.
+    weak var appState: AppState?
+
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard let appState,
+              case .mounted(let drive, _, _) = appState.state else {
+            return .terminateNow
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Eject “\(drive.name)” before quitting?"
+        alert.informativeText =
+            "The decrypted volume is still mounted, and a plaintext copy of it "
+            + "remains at /private/tmp/bl. Eject the volume and delete that "
+            + "image, or leave it mounted."
+        alert.addButton(withTitle: "Eject & Quit")        // first  button
+        alert.addButton(withTitle: "Quit, Keep Mounted")  // second button
+        alert.addButton(withTitle: "Cancel")              // third  button
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            // Async eject + cleanup, then let termination proceed.
+            Task { @MainActor in
+                await appState.ejectAndCleanupForQuit()
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+        case .alertThirdButtonReturn:
+            return .terminateCancel
+        default:
+            // "Quit, Keep Mounted" — the user's explicit choice to leave the
+            // plaintext volume and image in place.
+            return .terminateNow
+        }
+    }
+}
+
 @main
 struct BitLockerUnlockApp: App {
 
     /// Single source-of-truth instance shared via `@EnvironmentObject`.
     @StateObject private var appState = AppState()
 
+    /// Termination handler — see `AppDelegate` (F1-06).
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup("BitLocker Unlock") {
             ContentView()
                 .environmentObject(appState)
-                .task { appState.startWatching() }
+                .task {
+                    appState.startWatching()
+                    // F1-06: let the termination handler reach app state so it
+                    // can offer to eject + delete the plaintext image on quit.
+                    appDelegate.appState = appState
+                }
         }
         .windowResizability(.contentSize)
 
