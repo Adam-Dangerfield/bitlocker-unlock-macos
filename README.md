@@ -100,6 +100,14 @@ The `--secret-file PATH --secret-type T` protocol routes the BitLocker secret th
 
 A full security review lives at [docs/security/SECURITY_REVIEW_2026-05-18.md](docs/security/SECURITY_REVIEW_2026-05-18.md). All CRITICAL and HIGH findings except code-signing have been remediated; the remediation history is preserved in git. The remaining backlog (MEDIUM/LOW) is tracked as open issues. Threat model is single-user macOS; do not use this for distribution to others without a signed build.
 
+### Plaintext image on disk
+
+Path A (`bl-open`, `bl unlock`, the app's default flow) writes a **fully decrypted, unencrypted** copy of the volume to `/private/tmp/bl/decrypted.img`. Treat that file as sensitive as the drive itself:
+
+- **Delete it when done** — `./bl cleanup --image /private/tmp/bl/decrypted.img`, the app's auto-cleanup-on-eject, or plain `rm`.
+- **Backups:** macOS Time Machine already excludes `/private/tmp`, but third-party backup tools (Carbon Copy Cloner, `rsync` jobs, MDM backup agents) may not. Explicitly exclude `/private/tmp/bl` from any such tool — otherwise the plaintext image is copied to the backup destination, which may be less protected than the Mac.
+- For a **no-plaintext-on-disk** posture, use Path B (FUSE-T streaming) — it never materialises the image.
+
 ## License
 
 GPLv2. See [LICENSE](LICENSE).
