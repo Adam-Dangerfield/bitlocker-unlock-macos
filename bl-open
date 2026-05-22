@@ -212,7 +212,10 @@ echo "Attaching plaintext image..."
 if [[ "$(stat -f %u "$IMG")" != "$(id -u)" ]]; then
   sudo chown "$(id -u):$(id -g)" "$IMG"
 fi
-hdiutil attach "$IMG"
+# F5-07: -nobrowse keeps the plaintext volume out of the Finder sidebar so it
+# isn't advertised to anyone with physical / screen-sharing access. `bl` already
+# does this; bl-open must match. Mount point is still printed below.
+hdiutil attach -nobrowse "$IMG"
 
 echo
 echo "Done. To clean up later:"
