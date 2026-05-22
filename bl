@@ -88,6 +88,11 @@ LOG_FILE       = IMG_DIR / "dislocker.log"
 # Match BitLocker recovery key shape: 8 groups of 6 digits.
 RECOVERY_RE = re.compile(r"^\d{6}(-\d{6}){7}$")
 
+# Match a genuine macOS disk device node: /dev/diskN, /dev/diskNsM, and
+# APFS-synthesised forms like /dev/diskNsMsK. Anchored — rejects path
+# traversal (/dev/../etc/passwd), named pipes, and any non-disk node (F2-05).
+DEVICE_RE = re.compile(r"^/dev/disk[0-9]+(s[0-9]+)*$")
+
 # Reasonable subset of external bus protocols for USB drives.
 EXTERNAL_BUSES = {"USB", "FireWire", "Thunderbolt", "SD"}
 
@@ -212,6 +217,20 @@ def _safe_under(path: Path, root: Path) -> bool:
     if target == safe_root:
         return True
     return safe_root in target.parents
+
+
+def _validate_device(device: str, *, json_mode: bool) -> None:
+    """F2-05: accept only genuine macOS disk device nodes.
+
+    ``device`` is handed to ``diskutil info`` and, under sudo, to
+    ``dislocker-file``'s ``-V`` flag. Argument-list quoting already prevents
+    shell injection, but a path like ``/dev/../etc/passwd`` or a named pipe
+    should never reach the root binary — so anchor it to ``/dev/diskN[sM…]``.
+    """
+    if not DEVICE_RE.match(device):
+        fail("BAD_DEVICE",
+             f"--device must be a /dev/diskN[sM] node (got {device!r})",
+             json_mode=json_mode, exit_code=2)
 
 
 # ---------- diskutil ----------
@@ -718,6 +737,10 @@ def cmd_unlock(args) -> int:
     if not DISLOCKER_FILE.is_file():
         fail("MISSING_DISLOCKER", f"{DISLOCKER_FILE} not built", json_mode=args.json)
 
+    # F2-05: reject anything that is not a /dev/disk node before it reaches
+    # diskutil or the root dislocker-file invocation.
+    _validate_device(args.device, json_mode=args.json)
+
     # F2-02: --out PATH must resolve under IMG_DIR (no arbitrary root-write).
     # Check this FIRST, before any device probing or secret prompting, so a
     # path-traversal attempt is rejected with a clear error.
@@ -850,6 +873,9 @@ def cmd_mount(args) -> int:
              "dislocker-fuse not built. Install FUSE-T "
              "(`brew install --cask fuse-t`) and rebuild dislocker with -DWITH_FUSE=ON.",
              json_mode=args.json)
+
+    # F2-05: reject anything that is not a /dev/disk node.
+    _validate_device(args.device, json_mode=args.json)
 
     secret = resolve_secret(args, json_mode=args.json)
 
