@@ -202,6 +202,20 @@ public final class AppState: ObservableObject {
         }
     }
 
+    /// Best-effort eject + plaintext-image deletion for app termination
+    /// (F1-06). Unlike `ejectMounted()`, cleanup here is unconditional and not
+    /// gated on the `autoCleanupOnEject` preference: once the app quits there
+    /// is no owner left to manage a lingering decrypted volume or its
+    /// `/private/tmp/bl` image. Errors are swallowed — the app is on its way
+    /// out and there is no UI left to surface them to.
+    public func ejectAndCleanupForQuit() async {
+        guard case .mounted(_, let mountPath, let imagePath) = state else { return }
+        try? await bridge.eject(mountPath: mountPath)
+        if let imagePath {
+            try? await bridge.cleanup(imagePath: imagePath)
+        }
+    }
+
     /// Acknowledge `.error` and return to `.detected` / `.idle`.
     public func dismissError() {
         state = drives.isEmpty ? .idle : .detected(drives: drives)
