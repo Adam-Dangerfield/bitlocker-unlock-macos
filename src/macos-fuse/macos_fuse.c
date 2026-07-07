@@ -1,13 +1,19 @@
 #include "macos_fuse.h"
 #include "bitlocker_crypto.h"
 #include <fuse.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int bitlocker_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
+/*
+ * NOTE: fuse-t / macFUSE ship the FUSE 2.x API (see fuse.h: 2-arg getattr,
+ * 4-arg fill_dir, 5-arg readdir). These handlers match that ABI. If this is
+ * ever moved to libfuse3, the getattr/readdir signatures change.
+ */
+
+static int bitlocker_getattr(const char *path, struct stat *stbuf)
 {
-    (void)fi;
     memset(stbuf, 0, sizeof(struct stat));
 
     if (strcmp(path, "/") == 0) {
@@ -20,23 +26,23 @@ static int bitlocker_getattr(const char *path, struct stat *stbuf, struct fuse_f
 }
 
 static int bitlocker_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                             off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags)
+                             off_t offset, struct fuse_file_info *fi)
 {
     (void)offset;
     (void)fi;
-    (void)flags;
 
     if (strcmp(path, "/") != 0) {
         return -ENOENT;
     }
 
-    filler(buf, ".", NULL, 0, 0);
-    filler(buf, "..", NULL, 0, 0);
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
     return 0;
 }
 
 static int bitlocker_open(const char *path, struct fuse_file_info *fi)
 {
+    (void)path;
     (void)fi;
     return -ENOENT;
 }
@@ -48,6 +54,7 @@ static int bitlocker_read(const char *path, char *buf, size_t size, off_t offset
     (void)path;
     (void)offset;
     (void)size;
+    (void)buf;
 
     return -ENOENT;
 }
