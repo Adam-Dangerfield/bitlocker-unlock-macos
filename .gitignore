@@ -25,3 +25,10 @@
 # Secret files (defense-in-depth: should never persist outside /tmp anyway)
 bl-secret.*
 bl-secret-*
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Compiled privileged-helper stub (built by helper/install-helper.sh)
+/helper/bl-helper
