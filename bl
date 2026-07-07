@@ -16,9 +16,12 @@ Subcommands (JSON-friendly for UI wiring):
 
   bl mount  --device DEV (--password P | --recovery R | --bek FILE
                           | --secret-file PATH --secret-type {password|recovery|bek})
-                          [--json]
+                          [--rw] [--json]
         FUSE-T streaming mount. Requires fuse-t + a dislocker built with -DWITH_FUSE=ON.
-        Final JSON: {mountPath: "..."} or {error: ...}.
+        Read-only by default (hdiutil). --rw mounts read-WRITE via ntfs-3g
+        (also FUSE-T) at /tmp/bl/mnt — the only way to write back to the NTFS
+        BitLocker volume on macOS; writes are re-encrypted to the device.
+        Final JSON: {mountPath: "...", writable: bool} or {error: ...}.
 
   bl eject   --mount PATH [--json]
         Detach an hdiutil-mounted plaintext image.
@@ -84,7 +87,12 @@ DISLOCKER_FUSE = DISLOCKER_DIR / "dislocker-fuse"
 IMG_DIR        = Path("/tmp/bl")
 DEFAULT_IMAGE  = IMG_DIR / "decrypted.img"
 FUSE_DIR       = IMG_DIR / "fuse"
+MNT_DIR        = IMG_DIR / "mnt"
 LOG_FILE       = IMG_DIR / "dislocker.log"
+
+# ntfs-3g (built against FUSE-T) provides read-WRITE NTFS, which macOS lacks
+# natively. Used by `bl mount --rw` to write back to the BitLocker volume.
+NTFS3G_BIN     = Path(os.environ.get("BL_NTFS3G", "/usr/local/bin/ntfs-3g"))
 
 # Match BitLocker recovery key shape: 8 groups of 6 digits.
 RECOVERY_RE = re.compile(r"^\d{6}(-\d{6}){7}$")
@@ -162,6 +170,39 @@ def warn_stderr(msg: str) -> None:
 
 # ---------- /tmp/bl safe-dir helpers (F5-01) ----------
 
+def _artifact_owner() -> tuple[int, int]:
+    """(uid, gid) of the human user who should own user-facing artifacts —
+    ``/tmp/bl``, the decrypted image, the log.
+
+    When bl runs unprivileged this is simply the caller. But the SwiftUI app
+    invokes the *entire* CLI as root via osascript ``do shell script ... with
+    administrator privileges``, so ``getuid()`` is 0. Falling back to it would
+    leave ``/tmp/bl`` and the image root-owned, locking out every later
+    user-context run — the CLI (``bl-open``) and Finder both fail on the
+    root-owned 0700 directory (F-IMGDIR-OWN). Resolve the real login user
+    instead: ``SUDO_UID`` when escalated via sudo, otherwise the owner of the
+    GUI console device. Falls back to the caller if neither is resolvable.
+    """
+    if os.geteuid() != 0:
+        return os.getuid(), os.getgid()
+    su = os.environ.get("SUDO_UID")
+    sg = os.environ.get("SUDO_GID")
+    if su is not None:
+        try:
+            uid = int(su)
+            gid = int(sg) if sg is not None else os.stat("/dev/console").st_gid
+            return uid, gid
+        except (ValueError, OSError):
+            pass
+    try:
+        cst = os.stat("/dev/console")
+        if cst.st_uid != 0:
+            return cst.st_uid, cst.st_gid
+    except OSError:
+        pass
+    return os.getuid(), os.getgid()
+
+
 def _ensure_safe_dir(path: Path, *, json_mode: bool) -> None:
     """Create ``path`` and verify it's a real, sanely-owned directory.
 
@@ -206,6 +247,24 @@ def _ensure_safe_dir(path: Path, *, json_mode: bool) -> None:
             os.chmod(str(path), 0o700)
         except OSError:
             pass
+
+    # F-IMGDIR-OWN: when running privileged (the app escalates the whole CLI via
+    # osascript), hand the directory to the real login user instead of leaving
+    # it root-owned. A root-owned 0700 /tmp/bl locks out every subsequent
+    # user-context run (CLI + Finder). Use O_NOFOLLOW|O_DIRECTORY + fchown so a
+    # mid-flight path swap can't redirect the chown (consistent with F5-02).
+    if euid == 0:
+        owner_uid, owner_gid = _artifact_owner()
+        if owner_uid != 0 and st.st_uid != owner_uid:
+            try:
+                dfd = os.open(str(path),
+                              os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+                try:
+                    os.fchown(dfd, owner_uid, owner_gid)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
 
 
 def _safe_under(path: Path, root: Path) -> bool:
@@ -560,6 +619,10 @@ class SudoKeepalive:
         self.pid: Optional[int] = None
 
     def __enter__(self) -> "SudoKeepalive":
+        # Already root (e.g. invoked by the privileged helper daemon): no sudo
+        # ticket to keep warm, and priming one would be pointless.
+        if os.geteuid() == 0:
+            return self
         # Prime the timestamp interactively first.
         subprocess.check_call(["sudo", "-v"])
         parent = os.getpid()
@@ -657,10 +720,13 @@ def _safe_chown_to_self(path: Path, *, json_mode: bool) -> None:
 
     try:
         st = os.fstat(fd)
-        if st.st_uid == os.getuid():
+        # F-IMGDIR-OWN: target the real login user, not getuid(). When the app
+        # runs bl as root via osascript, getuid() is 0, so the old code left the
+        # decrypted image root-owned — unreadable to the user who needs to mount
+        # and browse it.
+        uid, gid = _artifact_owner()
+        if st.st_uid == uid:
             return
-        uid = os.getuid()
-        gid = os.getgid()
         if os.geteuid() == 0:
             # Already root: no need to shell out to sudo.
             os.fchown(fd, uid, gid)
@@ -679,6 +745,20 @@ def _safe_chown_to_self(path: Path, *, json_mode: bool) -> None:
 
 # ---------- dislocker subprocess (pty for secret transport) ----------
 
+def _sudo(*args) -> list:
+    """Prefix a command with ``sudo -n`` unless we're already root.
+
+    When bl is invoked by the privileged helper daemon it already runs as root,
+    and that daemon's Full Disk Access is what lets dislocker open the raw
+    device. Re-launching dislocker through ``sudo`` would reset TCC's
+    responsible process to ``sudo`` (which has no FDA) and lose disk access — so
+    skip sudo entirely when euid is 0. It's also redundant work.
+    """
+    if os.geteuid() == 0:
+        return list(args)
+    return ["sudo", "-n", *args]
+
+
 def _spawn_dislocker(binary: Path, dislocker_args: list[str],
                      secret_bytes: Optional[bytes], log_fd: int,
                      *, use_pty: bool) -> subprocess.Popen:
@@ -696,67 +776,31 @@ def _spawn_dislocker(binary: Path, dislocker_args: list[str],
     """
     _assert_no_verbose(dislocker_args)
 
-    master_fd = -1
-    slave_fd = -1
-    stdin_arg = subprocess.DEVNULL
+    # dislocker reads the user password from stdin via getline() (see upstream
+    # user_pass.c: my_getpass only touches termios when stdin isatty()), so we
+    # feed the secret through a plain pipe. The secret transits the pipe, never
+    # argv — the same guarantee the previous pty dance provided, but without the
+    # pty/tty fragility that left dislocker hung at the prompt when there was no
+    # controlling terminal (e.g. under the privileged helper daemon).
+    stdin_arg = subprocess.PIPE if secret_bytes is not None else subprocess.DEVNULL
 
-    if use_pty and secret_bytes is not None:
-        master_fd, slave_fd = pty.openpty()
-        # Turn echo OFF on the slave so the secret bytes we write to master
-        # are not echoed back into our read buffer (and never reach the log).
-        try:
-            attrs = termios.tcgetattr(slave_fd)
-            # lflag is index 3
-            attrs[3] = attrs[3] & ~termios.ECHO
-            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
-        except termios.error:
-            pass
-        stdin_arg = slave_fd  # type: ignore[assignment]
-
-    # close_fds=True is the default in Py3; we explicitly pass the log fd via
-    # stdout/stderr=log_fd and the slave pty via stdin.
     proc = subprocess.Popen(
-        ["sudo", "-n", str(binary), *dislocker_args],
+        _sudo(str(binary), *dislocker_args),
         stdin=stdin_arg,
         stdout=log_fd,
         stderr=subprocess.STDOUT,
         close_fds=True,
-        pass_fds=(master_fd,) if master_fd >= 0 else (),
     )
 
-    # Parent doesn't need the slave end any more.
-    if slave_fd >= 0:
+    if secret_bytes is not None and proc.stdin is not None:
         try:
-            os.close(slave_fd)
+            proc.stdin.write(secret_bytes + b"\n")
+            proc.stdin.flush()
         except OSError:
             pass
-
-    # Write the secret to the master, then close it so dislocker sees EOF.
-    if master_fd >= 0 and secret_bytes is not None:
-        try:
-            payload = secret_bytes + b"\n"
-            # Best-effort write; the child may not yet be reading.
-            view = memoryview(payload)
-            while view:
-                # Non-blocking-ish: poll for writability with a small timeout.
-                try:
-                    _, w, _ = select.select([], [master_fd], [], 5.0)
-                except OSError:
-                    break
-                if not w:
-                    break
-                try:
-                    n = os.write(master_fd, view)
-                except OSError as e:
-                    if e.errno in (errno.EAGAIN, errno.EINTR):
-                        continue
-                    break
-                if n <= 0:
-                    break
-                view = view[n:]
         finally:
             try:
-                os.close(master_fd)
+                proc.stdin.close()
             except OSError:
                 pass
 
@@ -803,6 +847,25 @@ def cmd_detect(args) -> int:
             mnt = f"  mounted: {d['mountPoint']}" if d["mountPoint"] else ""
             print(f"{d['device']:<14} {human(d['sizeBytes']):>8}  [{tag}]  {d['name']}{mnt}")
     return 0
+
+
+def _dislocker_failure(rc: int, tail: list) -> tuple:
+    """Classify a dislocker failure into (error_code, short_message).
+
+    Detects the common 'macOS denied raw disk access' case — dislocker logs
+    'Failed to open /dev/diskN: Operation not permitted' and then often
+    segfaults (rc -11) — so the UI can show actionable Full Disk Access
+    guidance instead of a bare exit code.
+    """
+    joined = "\n".join(tail)
+    if "Operation not permitted" in joined or "Failed to open" in joined:
+        return ("NEEDS_DISK_ACCESS",
+                "macOS denied raw disk access. This requires Full Disk Access. "
+                "Because unlocking runs with administrator privileges, granting "
+                "it to this app alone may not be enough — the reliable fix is to "
+                "grant Full Disk Access to Terminal and run ./bl-open <device> "
+                "(or ./bl-mount) from Terminal.")
+    return ("DECRYPT_FAILED", f"dislocker-file exit {rc}")
 
 
 def cmd_unlock(args) -> int:
@@ -927,11 +990,9 @@ def cmd_unlock(args) -> int:
                 tail = Path(str(LOG_FILE)).read_text(errors="replace").splitlines()[-20:]
             except OSError:
                 tail = []
-            short = f"dislocker-file exit {rc}"
+            code, short = _dislocker_failure(rc, tail)
             full = short + ("\ntail:\n" + "\n".join(tail) if tail else "")
-            fail("DECRYPT_FAILED",
-                 short if args.json else full,
-                 json_mode=args.json)
+            fail(code, short if args.json else full, json_mode=args.json)
 
         # final 100% paint
         emit({"progress": 1.0, "bytesDone": total, "bytesTotal": total,
@@ -940,6 +1001,63 @@ def cmd_unlock(args) -> int:
     mount_path = hdiutil_attach(out_path, json_mode=args.json)
     emit({"mountPath": mount_path, "imagePath": str(out_path)}, json_mode=args.json)
     return 0
+
+
+def _detect_fs(inner: Path) -> str:
+    """Sniff the decrypted volume's filesystem from its boot sector.
+
+    BitLocker To Go volumes are commonly exFAT (which macOS reads AND writes
+    natively via hdiutil) rather than NTFS (read-only natively; needs ntfs-3g to
+    write). Returns 'exfat', 'ntfs', or 'unknown'.
+    """
+    try:
+        with open(inner, "rb") as f:
+            boot = f.read(512)
+    except OSError:
+        return "unknown"
+    if len(boot) >= 11 and boot[3:11] == b"EXFAT   ":
+        return "exfat"
+    if len(boot) >= 7 and boot[3:7] == b"NTFS":
+        return "ntfs"
+    return "unknown"
+
+
+def _ntfs3g_mount(inner: Path, *, json_mode: bool) -> str:
+    """Mount the dislocker-fuse-exposed decrypted volume read-WRITE via ntfs-3g.
+
+    The BitLocker volume's filesystem is NTFS, which macOS cannot write
+    natively (and `hdiutil attach` mounts it read-only). dislocker-fuse runs as
+    root and exposes the live decrypted volume as the file ``inner``; we mount
+    that file with ntfs-3g (compiled against FUSE-T) as root with ``allow_other``
+    so the invoking human user can read AND write it. Writes flow:
+        ntfs-3g  ->  dislocker-fuse  ->  re-encrypt  ->  physical device.
+    Must be called while a sudo ticket is warm (inside SudoKeepalive). Returns
+    the mount point.
+    """
+    if not NTFS3G_BIN.is_file():
+        fail("MISSING_NTFS3G",
+             f"ntfs-3g not found at {NTFS3G_BIN}. Install the FUSE-T NTFS driver "
+             "or set BL_NTFS3G; otherwise mount read-only (omit --rw).",
+             json_mode=json_mode)
+    _ensure_safe_dir(MNT_DIR, json_mode=json_mode)
+    # ntfs-3g daemonises after a successful mount. Run it as root (to reach the
+    # root-owned dislocker-fuse file and perform the privileged FUSE mount);
+    # allow_other grants the human user read/write access to the root mount.
+    rc = subprocess.call(
+        _sudo(str(NTFS3G_BIN), str(inner), str(MNT_DIR),
+              "-o", "rw,allow_other,local,volname=BitLocker"),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if rc != 0:
+        fail("NTFS3G_FAILED",
+             f"ntfs-3g exited {rc} mounting {inner} (run with the volume backed up)",
+             json_mode=json_mode)
+    # ntfs-3g can exit 0 yet fail to mount — confirm the mount actually appeared.
+    for _ in range(40):
+        if os.path.ismount(str(MNT_DIR)):
+            return str(MNT_DIR)
+        time.sleep(0.25)
+    fail("NTFS3G_NOT_READY", f"ntfs-3g did not mount at {MNT_DIR}", json_mode=json_mode)
 
 
 def cmd_mount(args) -> int:
@@ -994,18 +1112,57 @@ def cmd_mount(args) -> int:
             time.sleep(0.25)
         else:
             proc.terminate()
+            try:
+                tail = Path(str(LOG_FILE)).read_text(errors="replace").splitlines()[-20:]
+            except OSError:
+                tail = []
+            code, short = _dislocker_failure(-1, tail)
+            if code == "NEEDS_DISK_ACCESS":
+                fail(code, short, json_mode=args.json)
             fail("FUSE_NOT_READY", f"dislocker-fuse did not expose {inner}", json_mode=args.json)
 
-    mount_path = hdiutil_attach(inner, json_mode=args.json)
-    emit({"mountPath": mount_path, "fuseDir": str(FUSE_DIR)}, json_mode=args.json)
+        # Mount the decrypted volume, picking the driver by filesystem:
+        #  * exFAT/FAT  -> hdiutil raw-image attach = read-WRITE natively.
+        #  * NTFS + --rw -> ntfs-3g (macOS can't write NTFS natively).
+        #  * NTFS/other  -> hdiutil = read-only.
+        fs = _detect_fs(inner)
+        if fs == "exfat":
+            mount_path = hdiutil_attach(inner, json_mode=args.json)
+            writable = True
+        elif getattr(args, "rw", False):
+            mount_path = _ntfs3g_mount(inner, json_mode=args.json)
+            writable = True
+        else:
+            mount_path = hdiutil_attach(inner, json_mode=args.json)
+            writable = (fs in ("exfat", "fat"))
+
+    emit({"mountPath": mount_path, "fuseDir": str(FUSE_DIR), "writable": writable},
+         json_mode=args.json)
     return 0
 
 
 def cmd_eject(args) -> int:
-    rc = subprocess.call(["hdiutil", "detach", args.mount])
-    if rc != 0:
-        fail("EJECT_FAILED", f"hdiutil detach {args.mount} exit {rc}", json_mode=args.json)
-    emit({"detached": args.mount}, json_mode=args.json)
+    target = args.mount
+    # Path A images and read-only hdiutil attaches detach cleanly via hdiutil.
+    detached = subprocess.call(
+        ["hdiutil", "detach", target],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    # ntfs-3g / FUSE-T mounts (e.g. `mount --rw`) are root-owned and need
+    # `umount`; and either way the underlying dislocker-fuse streaming layer
+    # must be released so the physical device is freed. Both need root.
+    if not detached or os.path.ismount(str(FUSE_DIR)):
+        with SudoKeepalive():
+            if not detached and os.path.ismount(target):
+                detached = subprocess.call(
+                    _sudo("umount", target),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+            if os.path.ismount(str(FUSE_DIR)):
+                subprocess.call(
+                    _sudo("umount", str(FUSE_DIR)),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.path.ismount(target):
+        fail("EJECT_FAILED", f"could not unmount {target}", json_mode=args.json)
+    emit({"detached": target}, json_mode=args.json)
     return 0
 
 
@@ -1048,8 +1205,13 @@ def hdiutil_attach(path: Path, *, json_mode: bool = False) -> str:
     # before attaching — using O_NOFOLLOW + /dev/fd to defeat TOCTOU (F5-02).
     _safe_chown_to_self(path, json_mode=json_mode)
 
+    # The decrypted volume (Path A image, or the dislocker-fuse stream) is a
+    # RAW filesystem with no partition map or disk-image wrapper. Without the
+    # CRawDiskImage class hint, hdiutil rejects it with "image not recognised".
+    # With it, macOS mounts the filesystem — read-WRITE for exFAT/FAT natively.
     out = subprocess.check_output(
-        ["hdiutil", "attach", "-plist", "-nobrowse", str(path)]
+        ["hdiutil", "attach", "-plist", "-nobrowse",
+         "-imagekey", "diskimage-class=CRawDiskImage", str(path)]
     )
     p = plistlib.loads(out)
     for entity in p.get("system-entities", []):
@@ -1151,6 +1313,11 @@ def main(argv: list[str]) -> int:
     )
     p_mount.add_argument("--device", required=True)
     add_auth_flags(p_mount)
+    p_mount.add_argument(
+        "--rw", action="store_true",
+        help="mount read-WRITE via ntfs-3g (FUSE-T). Default is read-only "
+             "(hdiutil). Writes are re-encrypted back to the BitLocker drive.",
+    )
     p_mount.add_argument("--json", action="store_true")
     p_mount.set_defaults(func=cmd_mount)
 

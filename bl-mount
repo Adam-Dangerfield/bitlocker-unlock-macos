@@ -3,11 +3,13 @@
 #
 # Prereqs:
 #   1. brew install --cask fuse-t   (one-time, needs sudo + GUI approval)
-#   2. ./build.sh fuse              (rebuilds dislocker with -DWITH_FUSE=ON)
+#   2. ./build.sh                   (auto-detects FUSE-T, builds dislocker-fuse)
+#   For --rw also: the ntfs-3g FUSE-T NTFS driver at /usr/local/bin/ntfs-3g.
 #
 # Usage:
-#   ./bl-mount                # auto-detect first BitLocker drive
-#   ./bl-mount /dev/disk7s1   # explicit device
+#   ./bl-mount                # auto-detect first BitLocker drive (read-only)
+#   ./bl-mount /dev/disk7s1   # explicit device (read-only)
+#   ./bl-mount --rw /dev/...  # read-WRITE (ntfs-3g); writes re-encrypt to disk
 
 set -uo pipefail
 
@@ -28,7 +30,17 @@ cleanup_all() {
 }
 trap 'cleanup_all' EXIT INT TERM ERR
 
-DEVICE="${1:-}"
+RW=""
+DEVICE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--rw|--write) RW="--rw"; shift ;;
+    -h|--help)       sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    /dev/*)          DEVICE="$1"; shift ;;
+    *)               echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
 if [[ -z "$DEVICE" ]]; then
   DEVICE=$("$BL" detect --json | python3 -c "
 import json, sys
@@ -67,4 +79,15 @@ fi
 # Wipe PASS from shell memory immediately — the secret is now in the file.
 unset PASS
 
-exec "$BL" mount --secret-file "$SECRET_FILE" --secret-type "$SECRET_TYPE" --device "$DEVICE"
+# Run (not exec) so cleanup_all fires and wipes the secret file afterwards.
+"$BL" mount --secret-file "$SECRET_FILE" --secret-type "$SECRET_TYPE" --device "$DEVICE" $RW
+rc=$?
+
+if (( rc == 0 )) && [[ -n "$RW" ]]; then
+  echo
+  echo "Mounted READ-WRITE at /tmp/bl/mnt"
+  echo "  open /tmp/bl/mnt          # browse / edit in Finder"
+  echo "When finished, unmount CLEANLY (important for write integrity):"
+  echo "  ./bl eject --mount /tmp/bl/mnt"
+fi
+exit "$rc"
