@@ -80,7 +80,25 @@ public final class BackendBridge: @unchecked Sendable {
         }
     }
 
-    /// `./bl unlock --device DEV ... --json`
+    /// Unlock + mount `device`.
+    ///
+    /// Prefers the privileged `bl-helper` daemon when it's installed: it runs as
+    /// root with Full Disk Access, so it can actually open the raw device (the
+    /// osascript path can't — macOS denies it, surfaced as NEEDS_DISK_ACCESS).
+    /// The helper uses Path B (streaming FUSE mount), which mounts exFAT/FAT
+    /// volumes read-write. Falls back to the legacy osascript decrypt-to-image
+    /// path when the helper isn't installed.
+    public func unlock(
+        device: String,
+        method: UnlockMethod
+    ) -> AsyncThrowingStream<UnlockEvent, Error> {
+        if HelperClient.isInstalled {
+            return HelperClient.mountStream(device: device, method: method)
+        }
+        return legacyUnlock(device: device, method: method)
+    }
+
+    /// `./bl unlock --device DEV ... --json` via osascript (legacy fallback).
     ///
     /// Streams `UnlockEvent` values. Implementation note: because osascript
     /// blocks, we cannot read NDJSON line-by-line from stdout — we get the
@@ -89,7 +107,7 @@ public final class BackendBridge: @unchecked Sendable {
     ///
     /// SECURITY (F1-02): The secret is written to a 0600 temp file and passed
     /// via `--secret-file`; it is never placed in argv or the shell command string.
-    public func unlock(
+    private func legacyUnlock(
         device: String,
         method: UnlockMethod
     ) -> AsyncThrowingStream<UnlockEvent, Error> {
@@ -189,6 +207,19 @@ public final class BackendBridge: @unchecked Sendable {
                     }
                 }
 
+                // On failure, recover the real bl error code even when osascript
+                // wrapped it in an "execution error" string (the {"error":...}
+                // object lands in stderr, not as a clean stdout line). This lets
+                // the UI show a specific, actionable alert (e.g. disk access).
+                if result.exit != 0 {
+                    let blob = result.stdout + "\n" + result.stderr
+                    if let failEvent = Self.extractError(from: blob) {
+                        continuation.yield(failEvent)
+                        continuation.finish()
+                        return
+                    }
+                }
+
                 if result.exit != 0 && lines.isEmpty {
                     continuation.finish(throwing: BackendError.cliFailure(
                         code: "unlock_failed",
@@ -276,6 +307,13 @@ public final class BackendBridge: @unchecked Sendable {
 
     /// `./bl eject --mount PATH --json` — no root required.
     public func eject(mountPath: String) async throws {
+        // Prefer the helper: it's already root, so it tears down both the mount
+        // and dislocker-fuse with no admin/auth prompt (the osascript/sudo path
+        // pops a "Touch ID or Enter Password" dialog for a root-mounted volume).
+        if HelperClient.isInstalled {
+            try await HelperClient.eject(mount: mountPath)
+            return
+        }
         let result = try await runProcess(
             executable: "/usr/bin/env",
             args: ["python3", blPath, "eject", "--mount", mountPath, "--json"],
@@ -685,5 +723,28 @@ public final class BackendBridge: @unchecked Sendable {
         }
         // Tolerate the case where the final line is itself a progress line.
         return decodeStreamLine(line)
+    }
+
+    /// Pull an embedded bl error object out of a blob that may wrap it. When the
+    /// privileged unlock fails, osascript reports it as an "execution error"
+    /// string with bl's `{"error":...,"message":...}` JSON appended to stderr
+    /// rather than as a clean stdout line — so a plain line-decode misses it and
+    /// the UI falls back to a generic "unlock_failed". This recovers the real
+    /// code (e.g. NEEDS_DISK_ACCESS) so the UI can show actionable guidance.
+    /// Returns the last decodable ErrorPayload as a `.failed` event, or nil.
+    static func extractError(from blob: String) -> UnlockEvent? {
+        guard let regex = try? NSRegularExpression(pattern: #"\{[^{}]*"error"[^{}]*\}"#) else {
+            return nil
+        }
+        let ns = blob as NSString
+        let matches = regex.matches(in: blob, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            let json = ns.substring(with: m.range)
+            if let data = json.data(using: .utf8),
+               let e = try? JSONDecoder().decode(ErrorPayload.self, from: data) {
+                return .failed(code: e.error, message: e.message)
+            }
+        }
+        return nil
     }
 }
