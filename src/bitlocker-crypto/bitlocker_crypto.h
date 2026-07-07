@@ -2,6 +2,7 @@
 #define BITLOCKER_CRYPTO_H
 
 #include <stdbool.h>
+#include <stddef.h>   /* size_t — not guaranteed to come in via <stdint.h> */
 #include <stdint.h>
 
 #ifdef __cplusplus
