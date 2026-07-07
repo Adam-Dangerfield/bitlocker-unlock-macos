@@ -12,7 +12,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(USE_OPENSSL "Use OpenSSL libcrypto"           ON)
 option(USE_MBEDTLS "Use mbedTLS libcrypto"           OFF)
-option(BUILD_MACOS_FUSE "Build the src/macos-fuse adapter (requires FUSE-T or macFUSE)" AUTO)
+# Tri-state (AUTO/ON/OFF): AUTO builds the FUSE adapter only when FUSE is found.
+# Must be a STRING, not option() — option() is boolean and would coerce AUTO to OFF.
+set(BUILD_MACOS_FUSE "AUTO" CACHE STRING
+    "Build the src/macos-fuse adapter (AUTO/ON/OFF; requires FUSE-T or macFUSE)")
 
 find_package(OpenSSL REQUIRED)
 
