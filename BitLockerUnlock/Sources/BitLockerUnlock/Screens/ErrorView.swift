@@ -77,6 +77,17 @@ private struct ErrorContent: View {
 
             // ── Action buttons ────────────────────────────────────────────
             VStack(spacing: 6) {
+                // For the disk-access failure, lead with a direct jump to the
+                // System Settings pane the user needs (Full Disk Access).
+                if code == "NEEDS_DISK_ACCESS" {
+                    Button("Open Full Disk Access Settings…") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
                 HStack(spacing: 8) {
                     Button("Copy error details") {
                         copyToClipboard(code: code, message: message)
@@ -127,6 +138,7 @@ private struct ErrorContent: View {
         case "WRONG_RECOVERY_KEY":  return "Wrong recovery key"
         case "NOT_BITLOCKER":       return "Not a BitLocker volume"
         case "PERMISSION_DENIED":   return "Permission denied (need admin)"
+        case "NEEDS_DISK_ACCESS":   return "Can’t access the drive"
         case "DECRYPT_FAILED":      return "Decryption failed"
         case "MISSING_DISLOCKER":   return "Decryption tool missing"
         case "CANCELLED":           return "Cancelled"

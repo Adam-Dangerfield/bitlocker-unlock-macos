@@ -65,6 +65,20 @@ for dylib in "$DISLOCKER_BIN_SRC"/libdislocker*.dylib; do
     [[ -f "$dylib" ]] && cp "$dylib" "$DISLOCKER_BIN_DST/"
 done
 
+# ---------- F-RPATH-BUNDLE: make @rpath/libdislocker resolve inside the bundle ----------
+# The dislocker binaries link libdislocker via @rpath/libdislocker.0.7.dylib,
+# and their only baked-in rpath is the absolute build dir under ~/Documents.
+# At runtime the app's sandbox/TCC BLOCKS reading ~/Documents, so dyld can't
+# load libdislocker -> abort (SIGABRT, surfaced as `dislocker-file exit -6`).
+# Add @executable_path (= this dislocker-bin/ dir, where the dylib is bundled)
+# to each binary's rpath, and drop the unusable absolute build-dir rpath.
+for bin in dislocker-file dislocker-metadata dislocker-bek dislocker-fuse; do
+    bpath="$DISLOCKER_BIN_DST/$bin"
+    [[ -x "$bpath" ]] || continue
+    install_name_tool -add_rpath "@executable_path" "$bpath" 2>/dev/null || true
+    install_name_tool -delete_rpath "$DISLOCKER_BIN_SRC" "$bpath" 2>/dev/null || true
+done
+
 # ---------- F7-04: bundle libmbedcrypto so the app is self-contained ----------
 # dislocker-file links against the Homebrew mbedtls@3 dylib by absolute path.
 # If we don't bundle it, the app breaks on any Mac that lacks mbedtls@3.
@@ -107,6 +121,15 @@ if [[ -x "$DISLOCKER_FILE_BIN" ]]; then
         echo "         The app may fail on machines without mbedtls@3 installed." >&2
     fi
 fi
+
+# Re-sign (ad-hoc) every binary/dylib whose load commands we rewrote above —
+# install_name_tool invalidates the existing code signature, which on Apple
+# Silicon causes the kernel to SIGKILL the process on exec.
+for f in "$DISLOCKER_BIN_DST"/dislocker-file "$DISLOCKER_BIN_DST"/dislocker-metadata \
+         "$DISLOCKER_BIN_DST"/dislocker-bek "$DISLOCKER_BIN_DST"/dislocker-fuse \
+         "$DISLOCKER_BIN_DST"/libdislocker*.dylib "$DISLOCKER_BIN_DST"/libmbedcrypto*.dylib; do
+    [[ -e "$f" ]] && codesign --force --sign - "$f" 2>/dev/null || true
+done
 
 # AppIcon.icns — bundle it if generated. Use `swift gen-icon.swift` to (re)generate.
 if [[ -f "$SCRIPT_DIR/AppIcon.icns" ]]; then

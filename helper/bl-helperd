@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""bl-helperd — privileged helper daemon for BitLockerUnlock.
+
+Runs as root (LaunchDaemon), launched by the stable `bl-helper` stub which holds
+the Full Disk Access grant. Because this process descends from that stub, TCC
+lets the `bl` subprocesses it spawns open raw BitLocker devices — the access the
+osascript path could never get.
+
+Protocol (one request per connection, on a Unix socket):
+  1. client -> one JSON line + '\n':
+       {"op":"detect"|"unlock"|"mount"|"eject"|"cleanup",
+        "device":"/dev/diskNsM",           # unlock/mount
+        "secretType":"password"|"recovery"|"bek",  # unlock/mount
+        "secretLen": <int>,                 # unlock/mount: bytes to read next
+        "rw": <bool>,                       # mount only
+        "mount":"/path", "image":"/path"}   # eject / cleanup
+  2. client -> exactly secretLen raw secret bytes (unlock/mount only).
+  3. daemon -> streams `bl <op> --json` stdout (NDJSON) back, then closes.
+
+The secret is written to a mode-0600 temp file and passed to bl via
+--secret-file (never on argv), matching bl's own F1-01 hardening.
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+
+CONF = "/usr/local/etc/bl-helper.conf"
+SOCK = "/usr/local/var/run/bl-helper.sock"
+ALLOWED = {"detect", "unlock", "mount", "eject", "cleanup", "probe"}
+DEVICE_OK = __import__("re").compile(r"^/dev/disk\d+(s\d+)*$")
+
+
+def load_conf() -> dict:
+    conf = {}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def console_ids():
+    """(uid, gid) of the logged-in GUI user — who may connect to the socket."""
+    try:
+        st = os.stat("/dev/console")
+        return st.st_uid, st.st_gid
+    except OSError:
+        return 0, 0
+
+
+def build_args(bl: str, req: dict, secret_file):
+    op = req["op"]
+    args = ["/usr/bin/python3", bl, op, "--json"]
+    if op in ("unlock", "mount"):
+        dev = req.get("device", "")
+        if not DEVICE_OK.match(dev):
+            raise ValueError("bad device")
+        args += ["--device", dev]
+        if op == "mount" and req.get("rw"):
+            args += ["--rw"]
+        if secret_file:
+            args += ["--secret-file", secret_file,
+                     "--secret-type", req.get("secretType", "password")]
+    elif op == "eject":
+        args += ["--mount", req["mount"]]
+    elif op == "cleanup":
+        args += ["--image", req["image"]]
+    # detect: no extra args
+    return args
+
+
+def handle(conn):
+    conf = load_conf()
+    bl = conf.get("BL_PATH", "/usr/local/libexec/bl")
+    env = dict(os.environ)
+    if conf.get("BL_DISLOCKER_DIR"):
+        env["BL_DISLOCKER_DIR"] = conf["BL_DISLOCKER_DIR"]
+    if conf.get("BL_NTFS3G"):
+        env["BL_NTFS3G"] = conf["BL_NTFS3G"]
+
+    f = conn.makefile("rb")
+    header = f.readline()
+    try:
+        req = json.loads(header.decode("utf-8"))
+    except Exception:
+        conn.sendall(b'{"error":"BAD_REQUEST","message":"malformed header"}\n')
+        return
+    if req.get("op") not in ALLOWED:
+        conn.sendall(b'{"error":"BAD_OP","message":"unsupported op"}\n')
+        return
+
+    # `probe` opens the raw device directly (no secret). Its purpose is to
+    # trigger the Full Disk Access TCC check as a descendant of the bl-helper
+    # stub, so a denial registers bl-helper in the Full Disk Access list (off)
+    # for the user to enable — and, once enabled, to confirm access works.
+    if req["op"] == "probe":
+        dev = req.get("device", "")
+        if not DEVICE_OK.match(dev):
+            conn.sendall(b'{"error":"BAD_REQUEST","message":"bad device"}\n')
+            return
+        try:
+            fd = os.open(dev, os.O_RDONLY)
+            os.read(fd, 512)
+            os.close(fd)
+            conn.sendall(b'{"probe":"READ_OK","message":"helper can read the device"}\n')
+        except OSError as e:
+            conn.sendall(
+                ('{"probe":"FAILED","errno":%d,"message":"%s"}\n'
+                 % (e.errno or 0, e.strerror or "")).encode())
+        return
+
+    secret_file = None
+    try:
+        n = int(req.get("secretLen", 0) or 0)
+        if n > 0:
+            if n > 4096:
+                conn.sendall(b'{"error":"BAD_REQUEST","message":"secret too long"}\n')
+                return
+            secret = f.read(n)
+            fd, secret_file = tempfile.mkstemp(prefix="bl-secret.")
+            os.fchmod(fd, 0o600)
+            os.write(fd, secret)
+            os.close(fd)
+
+        args = build_args(bl, req, secret_file)
+        proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+        )
+        for line in proc.stdout:
+            try:
+                conn.sendall(line)
+            except OSError:
+                proc.terminate()
+                break
+        proc.wait()
+    except ValueError as e:
+        conn.sendall(f'{{"error":"BAD_REQUEST","message":"{e}"}}\n'.encode())
+    except Exception as e:  # noqa: BLE001
+        conn.sendall(f'{{"error":"HELPER_ERROR","message":"{e}"}}\n'.encode())
+    finally:
+        if secret_file:
+            try:
+                os.unlink(secret_file)
+            except OSError:
+                pass
+
+
+def main():
+    os.makedirs(os.path.dirname(SOCK), mode=0o755, exist_ok=True)
+    try:
+        os.unlink(SOCK)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK)
+    # Only the logged-in GUI user may connect (the app runs as that user).
+    uid, gid = console_ids()
+    try:
+        os.chown(SOCK, uid, gid)
+        os.chmod(SOCK, 0o600)
+    except OSError:
+        os.chmod(SOCK, 0o666)  # fall back to permissive if no console user
+    srv.listen(8)
+    sys.stderr.write("bl-helperd: listening on %s\n" % SOCK)
+    sys.stderr.flush()
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            continue
+        try:
+            handle(conn)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()
