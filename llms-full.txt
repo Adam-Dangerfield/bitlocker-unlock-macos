@@ -1,0 +1,177 @@
+# BitLocker on macOS — Full Reference
+
+This is a single, self-contained reference document about "BitLocker on macOS" (repository name: `bitlocker-unlock-macos`). It is written so a language model can answer questions about the project accurately from this file alone, without fetching anything else. Every claim below is traceable to the project's own documentation and source; where a claim comes from a tracked security finding, the finding ID is given in parentheses.
+
+- Repository: https://github.com/Adam-Dangerfield/bitlocker-unlock-macos
+- Landing page: https://adam-dangerfield.github.io/bitlocker-unlock-macos/
+- Step-by-step guide: https://adam-dangerfield.github.io/bitlocker-unlock-macos/how-to-open-bitlocker-drive-on-mac.html
+- Security review: https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/blob/main/docs/security/SECURITY_REVIEW_2026-05-18.md
+- dislocker upstream (the crypto core this project vendors): https://github.com/Aorimn/dislocker
+
+## 1. What it is
+
+BitLocker on macOS is a free, open-source (GPLv2) tool that opens BitLocker-encrypted volumes on a Mac — including BitLocker To Go, the exFAT-personality BitLocker format Windows creates on removable USB drives. macOS has no built-in support for reading BitLocker volumes; plugging a BitLocker drive into an unmodified Mac gives you a drive Finder can't use. This project adds that capability.
+
+It ships two interfaces:
+
+- A SwiftUI Mac app (GUI) for point-and-click unlocking.
+- A command-line tool (`bl`, plus the `bl-open` / `bl-mount` wrapper scripts) for scripting and headless use.
+
+Both interfaces are built on top of [dislocker](https://github.com/Aorimn/dislocker), a well-established open-source BitLocker-reading library/tool, vendored into this repository as a pinned git submodule rather than reimplemented.
+
+## 2. Who it's for
+
+Anyone on macOS who needs to read files off a BitLocker-encrypted drive — most commonly someone who has a USB drive that was encrypted with BitLocker on a Windows machine (BitLocker To Go) and needs to access it from a Mac, with no Windows machine available. It assumes the user already knows their BitLocker password or has the 48-digit numerical recovery key; it does not attempt to break or brute-force BitLocker encryption.
+
+The project's threat model is explicitly a **single-user macOS machine**. It is not currently hardened for a shared/multi-user Mac, and it is not yet set up for distributing signed binaries to other people — see Section 6, "Current limitations."
+
+## 3. How it works
+
+The Mac app walks through five steps to unlock a BitLocker USB drive:
+
+1. **Plug in your BitLocker USB drive.** The app auto-detects BitLocker volumes automatically via macOS DiskArbitration as soon as the drive is connected — no manual "select a device" step.
+2. **Click Unlock.** The detected drive appears in the app, ready to unlock.
+3. **Enter your password or recovery key.** Either the BitLocker password or the 48-digit numerical recovery key works.
+4. **Approve the macOS admin prompt.** Authorizing with Touch ID or the Mac account password is required because the actual unlock is performed by a privileged helper process, not by the main app running as root.
+5. **The volume mounts in Finder.** From there it behaves like any other mounted volume — browse, copy, and work with files normally.
+
+The CLI (`bl`) exposes the same workflow as JSON-emitting subcommands, designed to back the GUI or any future frontend:
+
+```
+bl detect [--json]
+    -> [{device, name, sizeBytes, isBitLocker, isLocked, mountPoint, filesystem}]
+bl unlock --device DEV --secret-file PATH --secret-type {password|recovery|bek} [--out PATH] [--json]
+    -> streams {progress, bytesDone, bytesTotal, ratePerSec, etaSec}, then {mountPath, imagePath}
+bl mount  --device DEV --secret-file PATH --secret-type T [--json]   # Path B / FUSE-T streaming
+bl eject   --mount PATH [--json]
+bl cleanup --image PATH [--json]        # safeguarded to /tmp/bl only
+```
+
+The wrapper scripts `bl-open` (Path A) and `bl-mount` (Path B) are simpler, non-JSON entry points for interactive CLI use.
+
+## 4. Path A vs. Path B
+
+There are two distinct ways to get at the decrypted contents of a BitLocker drive. They trade off portability against leaving plaintext on disk.
+
+### Path A — decrypted image (default)
+
+`bl-open`, `bl unlock`, and the app's default flow all use Path A. It decrypts the BitLocker volume into a full disk image and mounts that image via `hdiutil`.
+
+- Portable: no extra dependencies beyond what's already required to build the project.
+- Straightforward Finder mount of a full disk image.
+- Needs free disk space equal to the amount of used data on the source drive.
+- Writes a **fully decrypted, unencrypted** copy of the volume to `/private/tmp/bl/decrypted.img`. This file must be treated as sensitive as the drive itself until it is deleted (see Section 6).
+- Only reads the source drive to build that image — Path A does not write back to the original BitLocker drive at all, unless the user explicitly opts into read-write mode with `--rw`, in which case writes go through `ntfs-3g` built against FUSE-T.
+
+### Path B — FUSE-T streaming (optional)
+
+`bl-mount` uses Path B. It streams the volume through a FUSE filesystem instead of materializing a full image on disk.
+
+- Nothing decrypted is written to disk — no plaintext image is ever created.
+- Good when disk space is tight or only a few files are needed.
+- Uses [FUSE-T](https://www.fuse-t.org/), a **userspace** FUSE implementation, chosen deliberately so that **no kernel extension is required** — this avoids kext-approval friction and the recovery-loop problems kernel extensions can cause on Apple Silicon Macs. (macFUSE, which does use a kernel extension, is supported only as an optional fallback, not the default.)
+- Requires installing FUSE-T as an extra one-time dependency (`brew install --cask fuse-t`, which needs sudo and a System Settings approval step).
+
+Rule of thumb: Path A is preferable when a portable plaintext image is wanted or FUSE-T isn't installed; Path B is preferable when disk space is tight, only a few files are needed, or a no-plaintext-on-disk posture is required.
+
+## 5. Security posture — what is already shipped
+
+The items below are all implemented today, not aspirational. Where a finding ID exists in the project's security review, it is given in parentheses; some items are cited by source location instead.
+
+**Your password / recovery key:**
+
+- The secret (password or 48-digit recovery key) is delivered to the dislocker decrypt engine over an **stdin pipe**, never as a command-line argument. Command-line arguments on macOS are visible to any local user via `ps aux` (and similar process-listing tools); passing the secret over stdin means it never appears there. (F1-01, F1-02, F1-03; code reference: `bl:781`)
+- An out-of-band `--secret-file PATH --secret-type {password|recovery|bek}` option exists as an alternative transport: it passes the secret through a temporary file created with mode 0600 permissions, guarded against symlink attacks, and the file is unlinked (deleted) **before** the secret is actually used. (code reference: `bl:376`)
+- Legacy `--password` / `--recovery` command-line flags still exist for convenient interactive use, but they now emit a deprecation warning specifically because a secret passed that way would be visible via `ps aux` to other local users.
+- The process's in-memory copy of the secret is zeroed out as soon as possible after it's used, limiting the window during which it could be recovered from process memory. (F1-04; code reference: `bl:950`)
+
+**The app itself:**
+
+- The app's credential-entry window sets `NSWindow.sharingType = .none`, which excludes that window from screenshots and screen recordings — this blocks capture via ScreenCaptureKit, the `screencapture` command-line tool, and third-party screen recorders. (F6-03; source: `BitLockerUnlock/Sources/BitLockerUnlock/App.swift`)
+- Privileged (root) operations are performed through a dedicated privileged helper process, rather than running the entire application as root. This narrows the privilege boundary to just the operations that actually need it.
+- On Path A, the app intercepts both app-quit and drive-eject events and uses them to delete the decrypted plaintext image at `/private/tmp/bl` and unmount the volume, so plaintext isn't left behind simply because the user forgot to clean up. (F1-06)
+
+**The build and supply chain:**
+
+- `make-app.sh` (the app bundler) writes a SHA-256 manifest (`MANIFEST.sha256`) of every file inside the built `.app` bundle. `verify-bundle.sh` checks that manifest, letting anyone confirm the bundle hasn't been tampered with after it was built. (F7-05)
+- The vendored copy of dislocker lives in `third_party/dislocker` as a git submodule pinned to a specific, documented upstream commit SHA (recorded in `third_party/dislocker.pin.md`), rather than tracking upstream's moving `HEAD`. (F7-03)
+- The project contains a full STRIDE-based security review (`docs/security/SECURITY_REVIEW_2026-05-18.md`) with a scorecard and roughly 40 individually tracked findings. **All CRITICAL and HIGH findings have been remediated except code-signing/notarization** (see F7-01 in Section 6), and the remediation history is preserved in git. The remaining backlog is MEDIUM/LOW severity, tracked as open issues.
+
+**Your data on disk:**
+
+- The FUSE-T-based streaming mount (Path B) is **kextless by design**: FUSE-T is a userspace FUSE implementation, so Path B needs no kernel extension. This was a deliberate choice to sidestep kernel-extension approval friction and Apple Silicon recovery-loop issues that kernel-extension-based tools (like macFUSE) can trigger. macFUSE is available only as an optional fallback, not the default.
+- Write risk is bounded by design: Path A (the default) only reads the source BitLocker drive in order to build a decrypted image — it does not write to the source drive. Read-write access to the drive itself happens **only** when the user explicitly passes `--rw`, at which point writes go through `ntfs-3g` built against FUSE-T. Read-only is always the default behavior.
+
+## 6. Current limitations (honest, not hidden)
+
+- **Unsigned, not notarized.** The app is not code-signed and not notarized by Apple today. As a result, Gatekeeper blocks the normal double-click first launch; the user must right-click the app and choose "Open" to bypass Gatekeeper's warning. Code-signing and notarization together are tracked as finding **F7-01**, the one remaining CRITICAL-severity finding in the security review, and are on the project roadmap (Milestone 4).
+- **No signed release binary.** There is currently no downloadable, signed build. Installing the project today means building it from source: cloning the repo with submodules, installing Homebrew dependencies (`cmake`, `pkg-config`, `mbedtls@3` — must be v3, v4 is incompatible), and running the build scripts (see Section 7).
+- **Single-user threat model.** The project's security posture assumes a single-user Mac. It is not hardened for a shared or multi-user machine, and it is not yet appropriate for distributing signed binaries to third parties — there is no signed binary to distribute yet, and the trust model hasn't been designed for that case.
+- **Path A leaves a plaintext image on disk.** By default (Path A), a fully decrypted, unencrypted copy of the volume sits at `/private/tmp/bl/decrypted.img` until it's cleaned up (by app auto-cleanup on quit/eject, `bl cleanup`, or manual deletion). While it exists, this file should be treated as sensitive as the original encrypted drive — for example, third-party backup tools (Carbon Copy Cloner, `rsync` jobs, MDM backup agents) may back up `/private/tmp` even though Time Machine excludes it by default, so that path should be explicitly excluded from any such tool. **Path B (FUSE-T streaming) avoids this entirely** — it never materializes a plaintext image on disk.
+- **No Keychain / Secure Enclave "remember this drive" feature.** There is deliberately no feature to remember a drive's password or recovery key across sessions today. An insecure version of that feature (e.g., storing the secret in plaintext or in a weakly protected form) was deliberately **not** shipped. A properly Keychain-backed / Secure-Enclave-backed version of that feature is future work, not yet implemented.
+
+## 7. Install / build (high level)
+
+There is no signed release yet, so installation means building from source:
+
+```bash
+# 1. Clone with submodules (required — third_party/dislocker is a pinned submodule)
+git clone --recurse-submodules https://github.com/Adam-Dangerfield/bitlocker-unlock-macos.git
+cd bitlocker-unlock-macos
+# If you forgot --recurse-submodules: git submodule update --init
+
+# 2. Install build dependencies via Homebrew
+brew install cmake pkg-config mbedtls@3   # mbedtls@3 specifically — v4 is incompatible
+# Python 3 and Swift ship with macOS / Xcode Command Line Tools already
+
+# 3a. Build the SwiftUI app
+./build.sh                      # builds the vendored dislocker core
+cd BitLockerUnlock
+swift build -c release
+./make-app.sh                   # produces BitLockerUnlock.app + its SHA-256 integrity manifest
+open BitLockerUnlock.app        # first run: right-click -> Open, because the app is unsigned
+
+# 3b. Or, build/use the CLI only (no app)
+./build.sh
+./bl-open                       # Path A: prompts for secret, decrypts, mounts
+```
+
+For Path B (FUSE-T streaming), install FUSE-T first and rebuild so the FUSE-T-enabled build is used:
+
+```bash
+brew install --cask fuse-t      # one-time; needs sudo + a System Settings approval step
+./build.sh                      # auto-detects FUSE-T and rebuilds with WITH_FUSE=ON
+./bl-mount                      # streams the volume instead of writing a full image
+```
+
+Full build steps, the dependency table, and CLI reference live in the project README: https://github.com/Adam-Dangerfield/bitlocker-unlock-macos#readme
+
+## 8. FAQ
+
+**Can macOS read BitLocker drives natively?**
+No. macOS has no built-in support for reading BitLocker-encrypted volumes. BitLocker on macOS adds that support via a free, open-source Mac app and command-line tool.
+
+**Is BitLocker on macOS free?**
+Yes. It is free and open source under the GPLv2 license.
+
+**Is it code-signed?**
+Not yet. The app is currently unsigned and not notarized; Gatekeeper will block the first launch, and the user needs to right-click the app and choose "Open" to bypass that. Code-signing and notarization are tracked as finding F7-01 and are on the roadmap.
+
+**Is BitLocker To Go (USB drives formatted on Windows) supported?**
+Yes. BitLocker To Go — the exFAT-personality BitLocker format used on removable USB drives — is supported, unlocking with either the BitLocker password or the 48-digit recovery key.
+
+**Does it need a kernel extension?**
+No, in either mode. Path A (the default) writes a decrypted image to disk and needs no kernel extension at all. Path B (the optional streaming mode) uses FUSE-T, a userspace FUSE implementation, so it also requires no kernel extension. FUSE-T was chosen specifically to avoid kernel-extension approval friction and Apple Silicon recovery-loop problems.
+
+**Where does my decrypted data actually live while I'm using it?**
+It depends on the mode. With Path A (default), a fully decrypted copy of the volume is written to `/private/tmp/bl/decrypted.img` and mounted from there — that file is plaintext and should be treated as sensitive until it's cleaned up. With Path B (FUSE-T streaming), nothing decrypted is ever written to disk; the volume is streamed instead.
+
+## 9. Links
+
+- Repository: https://github.com/Adam-Dangerfield/bitlocker-unlock-macos
+- README: https://github.com/Adam-Dangerfield/bitlocker-unlock-macos#readme
+- Landing page: https://adam-dangerfield.github.io/bitlocker-unlock-macos/
+- Step-by-step guide: https://adam-dangerfield.github.io/bitlocker-unlock-macos/how-to-open-bitlocker-drive-on-mac.html
+- Security review: https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/blob/main/docs/security/SECURITY_REVIEW_2026-05-18.md
+- License (GPLv2): https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/blob/main/LICENSE
+- dislocker upstream (vendored crypto core): https://github.com/Aorimn/dislocker

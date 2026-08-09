@@ -404,6 +404,9 @@
   }
   .feature-card h3 { font-size: 1.02rem; }
   .feature-card p { color: var(--text-muted); font-size: 0.95rem; margin: 0; }
+  .feature-card ul { margin: 0.6rem 0 0; padding-left: 1.15rem; color: var(--text-muted); font-size: 0.95rem; }
+  .feature-card li { margin-bottom: 0.5rem; }
+  .finding-id { font-size: 0.78rem; color: var(--text-muted); }
 
   .code-block {
     position: relative;
@@ -534,6 +537,7 @@
       <a href="#how-it-works">How it works</a>
       <a href="#modes">Modes</a>
       <a href="#install">Install</a>
+      <a href="#security">Security</a>
       <a href="#faq">FAQ</a>
       <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos">GitHub</a>
     </nav>
@@ -689,6 +693,66 @@
     </div>
   </section>
 
+  <section id="security">
+    <p class="kicker">Security &amp; privacy</p>
+    <h2>What this actually does to protect your data</h2>
+    <p class="lead">
+      BitLocker on macOS exists to open drives that protect sensitive data, so here is exactly what
+      it does to protect your password, your recovery key, and your files today &mdash; stated plainly,
+      including what it does <strong>not</strong> do yet.
+    </p>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <h3>Your password &amp; key</h3>
+        <ul>
+          <li>Sent to the decrypt engine over a private pipe, never as a command-line argument &mdash; it never shows up in <code>ps aux</code> or other local users&rsquo; process listings. <small class="finding-id">(F1-01, F1-02, F1-03)</small></li>
+          <li>An out-of-band secret-file option passes it through a locked-down (mode 0600), symlink-guarded temporary file that&rsquo;s deleted before it&rsquo;s ever read. <small class="finding-id">(code: bl:376)</small></li>
+          <li>The in-memory copy is zeroed out as soon as it&rsquo;s no longer needed. <small class="finding-id">(F1-04)</small></li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>The app itself</h3>
+        <ul>
+          <li>The unlock window is excluded from screenshots and screen recordings (<code>sharingType = .none</code>) &mdash; ScreenCaptureKit, <code>screencapture</code>, and third-party recorders can&rsquo;t capture it. <small class="finding-id">(F6-03)</small></li>
+          <li>Privileged (root) operations run through a dedicated helper process, not the whole app.</li>
+          <li>Quitting the app or ejecting the drive deletes the decrypted image and unmounts it &mdash; plaintext isn&rsquo;t left behind by accident. <small class="finding-id">(F1-06)</small></li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>The build &amp; supply chain</h3>
+        <ul>
+          <li>Every build writes a SHA-256 manifest of the app bundle, checked before you run it, to catch post-build tampering. <small class="finding-id">(F7-05)</small></li>
+          <li>The vendored dislocker crypto core is a git submodule pinned to a specific, documented upstream commit &mdash; not a moving target. <small class="finding-id">(F7-03)</small></li>
+          <li>An independent STRIDE-based security review with roughly 40 tracked findings covers the project; every CRITICAL and HIGH finding is remediated except code signing.</li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>Your data on disk</h3>
+        <ul>
+          <li>Path B&rsquo;s streaming mount uses FUSE-T, a <em>userspace</em> FUSE implementation &mdash; no kernel extension, chosen specifically to avoid kext-approval and Apple Silicon recovery-loop problems.</li>
+          <li>Path A (default) only reads the source drive to build a decrypted image; it never writes back to it. Read-write access happens only if you explicitly pass <code>--rw</code>.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="security-box">
+      <h3>Known limitations</h3>
+      <ul>
+        <li><strong>Unsigned, not notarized.</strong> Gatekeeper blocks the first launch; right-click &rarr; Open to bypass. This is the one remaining CRITICAL finding <span class="finding-id">(F7-01)</span> and is on the roadmap.</li>
+        <li><strong>No signed release yet.</strong> Installing today means building from source (Homebrew: <code>cmake</code>, <code>pkg-config</code>, <code>mbedtls@3</code>).</li>
+        <li><strong>Single-user threat model.</strong> Not hardened for a shared/multi-user Mac, and not yet set up for distributing signed binaries to other people.</li>
+        <li><strong>Path A leaves plaintext on disk.</strong> The decrypted image at <code>/private/tmp/bl</code> is sensitive until it&rsquo;s cleaned up &mdash; exclude it from third-party backup tools. Path B (FUSE-T streaming) avoids on-disk plaintext entirely.</li>
+        <li><strong>No Keychain / Secure Enclave integration yet.</strong> There&rsquo;s no &ldquo;remember this drive&rdquo; option &mdash; an insecure version of that was deliberately left unshipped; a Keychain-backed one is future work.</li>
+      </ul>
+    </div>
+
+    <p class="install-links">
+      Read the full <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/blob/main/docs/security/SECURITY_REVIEW_2026-05-18.md">security review on GitHub</a>,
+      or the <a href="how-to-open-bitlocker-drive-on-mac.html">step-by-step guide</a> to get started.
+    </p>
+  </section>
+
   <section id="install">
     <p class="kicker">Install</p>
     <h2>Get started</h2>
@@ -731,24 +795,6 @@
       <summary>Do I need a kernel extension?</summary>
       <p>No. The default mode (Path A) writes a decrypted image to disk and needs no kernel extension. The optional streaming mode (Path B) uses FUSE-T, a userspace FUSE implementation, so no kernel extension is required either way.</p>
     </details>
-  </section>
-
-  <section id="security">
-    <p class="kicker">Security note</p>
-    <h2>Honest about the trade-offs</h2>
-    <div class="security-box">
-      <h3>Single-user threat model</h3>
-      <ul>
-        <li>This tool is designed for a single-user Mac, not a shared or multi-user machine.</li>
-        <li>Path A writes a plaintext decrypted image to <code>/private/tmp/bl</code> &mdash; treat that path as sensitive while it exists. Path B (FUSE-T streaming) avoids writing on-disk plaintext.</li>
-        <li>A security review has been completed and CRITICAL/HIGH findings have been remediated, with the exception of code signing.</li>
-        <li>The app is intentionally unsigned right now; code signing and notarization are on the roadmap, alongside a native binary rewrite.</li>
-      </ul>
-      <p style="margin-top:1rem;">
-        Read the full write-up in the
-        <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/tree/main/docs">repository&rsquo;s security docs</a>.
-      </p>
-    </div>
   </section>
 
 </main>

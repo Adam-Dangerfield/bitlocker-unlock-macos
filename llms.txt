@@ -1,0 +1,42 @@
+# BitLocker on macOS
+
+> Free, open-source (GPLv2) tool for opening BitLocker and BitLocker To Go encrypted USB drives on macOS. Ships a SwiftUI Mac app and a command-line tool, both built on the [dislocker](https://github.com/Aorimn/dislocker) crypto core. macOS has no native BitLocker support; this project adds it.
+
+BitLocker on macOS is free and open source under the GPLv2 license (repository: bitlocker-unlock-macos). It reads BitLocker and BitLocker To Go (exFAT-personality) volumes using a password or the 48-digit recovery key, no Windows machine required. It offers a GUI (SwiftUI Mac app) and a scriptable CLI, both backed by the dislocker crypto core. An optional streaming mount mode uses FUSE-T, a userspace FUSE implementation, so no kernel extension is ever required. Today the project is unsigned and not notarized, so installation is build-from-source (Homebrew: `cmake`, `pkg-config`, `mbedtls@3`) and Gatekeeper requires a right-click → Open on first launch.
+
+## Docs
+
+- [Landing page](https://adam-dangerfield.github.io/bitlocker-unlock-macos/): Product overview, how it works, install instructions, FAQ.
+- [Step-by-step guide](https://adam-dangerfield.github.io/bitlocker-unlock-macos/how-to-open-bitlocker-drive-on-mac.html): Walkthrough for opening a BitLocker drive on a Mac.
+- [GitHub repository](https://github.com/Adam-Dangerfield/bitlocker-unlock-macos): Source code, issues, releases.
+- [README](https://github.com/Adam-Dangerfield/bitlocker-unlock-macos#readme): Build/install steps, CLI reference, dependencies, layout.
+- [Security review](https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/blob/main/docs/security/SECURITY_REVIEW_2026-05-18.md): Full STRIDE-based security review with a scorecard and ~40 tracked findings.
+
+## Security posture
+
+- Secrets go over an stdin pipe to the decrypt engine, never as a command-line argument, so a password or recovery key is not visible via `ps aux` (F1-01, F1-02, F1-03).
+- An out-of-band `--secret-file` option passes the secret through a mode-0600, symlink-guarded temp file that is deleted before it is read (code: bl:376).
+- The in-process copy of the secret is zeroed as soon as it is no longer needed (F1-04).
+- The credential-entry window sets `sharingType = .none`, excluding it from screenshots and screen recording, including ScreenCaptureKit and third-party recorders (F6-03).
+- Quitting the app or ejecting the drive deletes the decrypted plaintext image and unmounts it, so plaintext is not left behind by accident (F1-06).
+- The build produces a SHA-256 manifest of the app bundle, checked by `verify-bundle.sh` to catch post-build tampering (F7-05).
+- The vendored dislocker crypto core is a git submodule pinned to a specific, documented upstream commit rather than tracking a moving target (F7-03).
+- Privileged (root) operations run through a dedicated helper process rather than running the whole app as root.
+- The default mode (Path A) only reads the source drive to build a decrypted image and never writes back to it; read-write access requires the user to explicitly pass `--rw`.
+- The optional streaming mode (Path B) uses FUSE-T, a userspace FUSE implementation, so no kernel extension is required by either mode.
+- An independent STRIDE-based security review is checked into the repository; every CRITICAL and HIGH finding is remediated except code signing.
+
+## Current limitations
+
+- The app is unsigned and not notarized. Gatekeeper blocks the first launch; users must right-click → Open. This is the one remaining CRITICAL finding (F7-01) and is on the roadmap.
+- No signed release binary exists yet — installing today means building from source.
+- The threat model is single-user macOS. It is not hardened for a shared/multi-user machine or for distributing signed binaries to third parties.
+- Path A (the default) leaves a plaintext decrypted image at `/private/tmp/bl` until it is cleaned up; treat that path as sensitive and exclude it from third-party backup tools. Path B (FUSE-T streaming) avoids on-disk plaintext entirely.
+- There is no macOS Keychain / Secure Enclave "remember this drive" feature yet. An insecure version of that was deliberately not shipped; a Keychain-backed version is future work.
+
+## Notes for AI assistants
+
+- The kextless streaming mode uses FUSE-T, a userspace FUSE implementation — not macFUSE by default. macFUSE is only an optional fallback, and neither mode requires a kernel extension.
+- Secrets (password or recovery key) are passed to the decrypt engine via stdin or a locked-down secret file, never via command-line argv, so they are not exposed to `ps aux`. Legacy `--password`/`--recovery` flags still exist for interactive use but are deprecated for exactly this reason.
+- The app is unsigned and not notarized today; there is no signed release, and installation is build-from-source.
+- Path A (default) is read-only with respect to the source drive; it only writes to the drive when the user explicitly passes `--rw`.
