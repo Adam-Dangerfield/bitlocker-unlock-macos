@@ -287,6 +287,8 @@
   .hero-figure img {
     border-radius: 8px;
     width: 100%;
+    max-width: 380px;
+    margin: 0 auto;
     display: block;
   }
   .hero-figure figcaption {
@@ -560,9 +562,9 @@
       </p>
 
       <figure class="hero-figure">
-        <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 675'%3E%3Crect width='1200' height='675' fill='%23e2e8f0'/%3E%3C/svg%3E"
-             alt="Screenshot of the BitLocker on macOS app showing a detected BitLocker USB drive with an Unlock button, ready to enter a password or recovery key">
-        <figcaption>App screenshot placeholder &mdash; replace with a real screenshot of the unlock flow.</figcaption>
+        <img src="app-detected-drive.png" width="820" height="1043" loading="eager"
+             alt="BitLocker on macOS app auto-detecting a locked 128 GB BitLocker USB drive (/dev/disk4s1), with an Unlock button ready to enter a password or recovery key">
+        <figcaption>The app auto-detects your BitLocker drive &mdash; one click to unlock.</figcaption>
       </figure>
     </div>
   </section>
