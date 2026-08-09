@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b5fff">
+<title>How to Open a BitLocker Drive on Mac — Step by Step</title>
+<meta name="description" content="A simple, no-jargon guide to opening a BitLocker-encrypted USB drive on your Mac: what you need, the first-time warning, and step-by-step unlocking.">
+<link rel="canonical" href="https://adam-dangerfield.github.io/bitlocker-unlock-macos/how-to-open-bitlocker-drive-on-mac.html">
+
+<!-- Open Graph -->
+<meta property="og:title" content="How to Open a BitLocker Drive on Mac — Step by Step">
+<meta property="og:description" content="A simple, no-jargon guide to opening a BitLocker-encrypted USB drive on your Mac: what you need, the first-time warning, and step-by-step unlocking.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://adam-dangerfield.github.io/bitlocker-unlock-macos/how-to-open-bitlocker-drive-on-mac.html">
+<!-- TODO(human): og.png (1200x630) has not been created yet — placeholder reference only, no binary generated. -->
+<meta property="og:image" content="https://adam-dangerfield.github.io/bitlocker-unlock-macos/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:site_name" content="BitLocker on macOS">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="How to Open a BitLocker Drive on Mac — Step by Step">
+<meta name="twitter:description" content="A simple, no-jargon guide to opening a BitLocker-encrypted USB drive on your Mac: what you need, the first-time warning, and step-by-step unlocking.">
+<meta name="twitter:image" content="https://adam-dangerfield.github.io/bitlocker-unlock-macos/og.png">
+
+<!-- JSON-LD: HowTo -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "HowTo",
+  "name": "How to Open a BitLocker Drive on Mac",
+  "description": "Step-by-step instructions for opening a BitLocker-encrypted USB drive on a Mac using the free, open-source BitLocker on macOS app.",
+  "totalTime": "PT10M",
+  "step": [
+    {
+      "@type": "HowToStep",
+      "position": 1,
+      "name": "Open the app for the first time",
+      "text": "The first time you open the app, macOS may warn that it is from an unidentified developer. Right-click (or Control-click) the app icon, choose Open, then click Open again in the dialog. You only need to do this once."
+    },
+    {
+      "@type": "HowToStep",
+      "position": 2,
+      "name": "Plug in your BitLocker drive",
+      "text": "Connect the BitLocker USB drive to your Mac. The app automatically detects it and shows it in the drive list."
+    },
+    {
+      "@type": "HowToStep",
+      "position": 3,
+      "name": "Click Unlock and enter your password or recovery key",
+      "text": "Select the drive and click Unlock. Enter either your BitLocker password or the 48-digit recovery key (eight groups of six digits). You only need one of the two."
+    },
+    {
+      "@type": "HowToStep",
+      "position": 4,
+      "name": "Approve the macOS permission prompt",
+      "text": "Approve the prompt using Touch ID or your Mac login password. This is macOS asking permission for the app to do the unlocking work, and is expected."
+    },
+    {
+      "@type": "HowToStep",
+      "position": 5,
+      "name": "Wait for the drive to unlock",
+      "text": "A progress bar shows while the drive unlocks. This can take a little while for larger drives. When it finishes, the drive opens in Finder like a normal USB stick."
+    },
+    {
+      "@type": "HowToStep",
+      "position": 6,
+      "name": "Eject safely when finished",
+      "text": "When you are done with your files, eject the drive in Finder or using the app's eject option. The app can also clean up the temporary decrypted copy for you."
+    }
+  ]
+}
+</script>
+
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --bg-alt: #f5f7fa;
+    --bg-card: #ffffff;
+    --text: #1a2230;
+    --text-muted: #4a5568;
+    --border: #e2e8f0;
+    --accent: #0b5fff;
+    --accent-ink: #ffffff;
+    --accent-soft: #eaf1ff;
+    --code-bg: #0f172a;
+    --code-text: #e2e8f0;
+    --warn-bg: #fff8e6;
+    --warn-border: #f0c96b;
+    --warn-text: #6b4e00;
+    --focus: #0b5fff;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1220;
+      --bg-alt: #101a2c;
+      --bg-card: #131f33;
+      --text: #e6ecf5;
+      --text-muted: #a3b0c4;
+      --border: #223148;
+      --accent: #5b9dff;
+      --accent-ink: #06122a;
+      --accent-soft: #142a4d;
+      --code-bg: #060b16;
+      --code-text: #d9e2f1;
+      --warn-bg: #2a2308;
+      --warn-border: #6b5613;
+      --warn-text: #ecd489;
+      --focus: #7cb0ff;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 4px rgba(0, 0, 0, 0.5);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    line-height: 1.6;
+    font-size: 17px;
+    overflow-x: hidden;
+  }
+
+  img, svg { max-width: 100%; height: auto; display: block; }
+
+  a { color: var(--accent); text-decoration-thickness: from-font; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible,
+  button:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+  }
+
+  header.site-header {
+    border-bottom: 1px solid var(--border);
+    padding: 1.1rem 0;
+    position: sticky;
+    top: 0;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(180%) blur(8px);
+    z-index: 10;
+  }
+  header.site-header .wrap {
+    max-width: 1040px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-weight: 700;
+    color: var(--text);
+    text-decoration: none;
+    font-size: 1.02rem;
+  }
+  .brand:hover { text-decoration: none; }
+  .brand-mark {
+    width: 1.6rem;
+    height: 1.6rem;
+    border-radius: 6px;
+    background: linear-gradient(135deg, var(--accent), #7cb0ff);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 0.85rem;
+    flex-shrink: 0;
+  }
+  nav.site-nav {
+    display: flex;
+    gap: 1.25rem;
+    font-size: 0.95rem;
+  }
+  nav.site-nav a { color: var(--text-muted); text-decoration: none; }
+  nav.site-nav a:hover { color: var(--accent); }
+
+  main { max-width: 1040px; margin: 0 auto; padding: 0 1.5rem; }
+
+  section { padding: 3.5rem 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: none; }
+
+  .hero { padding-top: 3.75rem; padding-bottom: 3.25rem; }
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 0.3rem 0.7rem;
+    border-radius: 999px;
+    margin-bottom: 1.1rem;
+  }
+
+  .back-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-decoration: none;
+    margin-bottom: 1.4rem;
+  }
+  .back-link:hover { color: var(--accent); }
+
+  h1 {
+    font-size: clamp(2rem, 4.5vw, 2.85rem);
+    line-height: 1.15;
+    margin: 0 0 0.9rem;
+    letter-spacing: -0.02em;
+    max-width: 22ch;
+  }
+  .subhead {
+    font-size: 1.15rem;
+    color: var(--text-muted);
+    max-width: 58ch;
+    margin: 0 0 1.6rem;
+  }
+
+  .cta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.85rem;
+    margin-bottom: 1.1rem;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1.3rem;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.98rem;
+    text-decoration: none;
+    border: 1px solid transparent;
+    transition: transform 0.05s ease, filter 0.15s ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--accent-ink);
+    box-shadow: var(--shadow);
+  }
+  .btn-primary:hover { filter: brightness(1.08); text-decoration: none; }
+  .btn-secondary {
+    background: transparent;
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+
+  .meta-line {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+  }
+
+  h2 {
+    font-size: clamp(1.5rem, 3vw, 1.9rem);
+    letter-spacing: -0.01em;
+    margin: 0 0 1rem;
+  }
+  h3 {
+    font-size: 1.15rem;
+    margin: 0 0 0.5rem;
+  }
+  section > .kicker {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 0 0 0.6rem;
+  }
+  p { color: var(--text); }
+  section p.lead { font-size: 1.05rem; color: var(--text-muted); max-width: 68ch; }
+
+  .problem-box {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem 1.6rem;
+    margin-top: 1.25rem;
+  }
+  .problem-box ul { margin: 0.6rem 0 0; padding-left: 1.2rem; color: var(--text); }
+  .problem-box li { margin-bottom: 0.5rem; }
+
+  ol.steps {
+    list-style: none;
+    counter-reset: step;
+    margin: 1.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 1rem;
+  }
+  ol.steps li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 2.4rem 1fr;
+    gap: 0.9rem;
+    align-items: start;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.1rem;
+  }
+  ol.steps li::before {
+    content: counter(step);
+    width: 2.4rem;
+    height: 2.4rem;
+    border-radius: 8px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.05rem;
+  }
+  ol.steps strong { display: block; margin-bottom: 0.15rem; }
+  ol.steps span.step-detail { color: var(--text-muted); font-size: 0.96rem; }
+  ol.steps span.step-detail em { color: var(--text-muted); font-style: normal; font-weight: 600; }
+
+  details.faq-item {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.2rem 1.1rem;
+    margin-bottom: 0.75rem;
+    background: var(--bg-card);
+  }
+  details.faq-item summary {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.95rem 0;
+    list-style: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+  }
+  details.faq-item summary::-webkit-details-marker { display: none; }
+  details.faq-item summary::after {
+    content: "+";
+    font-size: 1.3rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    line-height: 1;
+  }
+  details.faq-item[open] summary::after { content: "\2212"; }
+  details.faq-item p { margin: 0 0 1rem; color: var(--text-muted); }
+
+  .security-box {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    color: var(--warn-text);
+    border-radius: 12px;
+    padding: 1.4rem 1.5rem;
+    margin-top: 1.25rem;
+  }
+  .security-box h3 { color: var(--warn-text); margin-top: 0; }
+  .security-box a { color: var(--warn-text); text-decoration-thickness: 2px; }
+  .security-box ol,
+  .security-box ul { margin: 0.6rem 0 0; padding-left: 1.2rem; }
+  .security-box li { margin-bottom: 0.4rem; }
+
+  footer.site-footer {
+    background: var(--bg-alt);
+    border-top: 1px solid var(--border);
+    padding: 2.5rem 0 3rem;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+  }
+  footer.site-footer .wrap { max-width: 1040px; }
+  .footer-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.25rem;
+    margin-bottom: 1rem;
+  }
+  .footer-links a { color: var(--text); text-decoration: none; font-weight: 500; }
+  .footer-links a:hover { color: var(--accent); }
+  .disclaimer { max-width: 68ch; }
+
+  .skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    background: var(--accent);
+    color: var(--accent-ink);
+    padding: 0.6rem 1rem;
+    border-radius: 0 0 8px 0;
+    z-index: 100;
+  }
+  .skip-link:focus { left: 0; }
+
+  @media (max-width: 600px) {
+    section { padding: 2.4rem 0; }
+    body { font-size: 16px; }
+    nav.site-nav { display: none; }
+  }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="index.html">
+      <span class="brand-mark" aria-hidden="true">🔓</span>
+      BitLocker on macOS
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a href="index.html#how-it-works">How it works</a>
+      <a href="index.html#modes">Modes</a>
+      <a href="index.html#install">Install</a>
+      <a href="index.html#faq">FAQ</a>
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero" id="top">
+    <div class="wrap" style="padding:0;max-width:100%;">
+      <a class="back-link" href="index.html">&larr; Back to overview</a>
+      <p class="eyebrow">Step-by-step &middot; No jargon &middot; For everyone</p>
+      <h1>How to Open a BitLocker Drive on Mac</h1>
+      <p class="subhead">
+        If someone handed you a BitLocker USB drive and a Mac, this guide walks you through
+        opening it &mdash; slowly, plainly, and without assuming you know anything about
+        encryption. Don&rsquo;t worry, you can&rsquo;t break anything by following along.
+      </p>
+      <p class="meta-line">Takes about 5&ndash;10 minutes, most of it waiting for the drive to unlock.</p>
+    </div>
+  </section>
+
+  <section id="what-you-need">
+    <p class="kicker">Before you start</p>
+    <h2>What you&rsquo;ll need</h2>
+    <p class="lead">Just three things. If you have all three, you&rsquo;re ready to go.</p>
+    <div class="problem-box">
+      <ul>
+        <li><strong>A Mac.</strong> Any recent Mac will do.</li>
+        <li><strong>The BitLocker USB drive</strong> &mdash; the encrypted drive you&rsquo;re trying to open.</li>
+        <li>
+          <strong>Either the drive&rsquo;s password, or its 48-digit recovery key.</strong>
+          You only need <em>one</em> of these, not both. The recovery key looks like a long
+          string of numbers split into eight groups of six digits, something like
+          <code>123456-123456-123456-123456-123456-123456-123456-123456</code>. If someone gave
+          you a printed slip of paper, a text file, or an email with a number like that on it,
+          that&rsquo;s your recovery key.
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="first-open">
+    <p class="kicker">Step 1</p>
+    <h2>The scary warning on first open is normal</h2>
+    <p class="lead">
+      This app is open source and hasn&rsquo;t been through Apple&rsquo;s paid approval process
+      yet, so the very first time you open it, macOS will show a warning. That&rsquo;s expected
+      &mdash; it doesn&rsquo;t mean anything is wrong.
+    </p>
+    <div class="security-box">
+      <h3>You&rsquo;ll see something like this</h3>
+      <p style="margin:0 0 0.75rem;">
+        &ldquo;[App name] cannot be opened because it is from an unidentified developer&rdquo;
+        or &ldquo;Apple could not verify [app name] is free of malware.&rdquo;
+      </p>
+      <p style="margin:0 0 0.5rem;font-weight:600;">Here&rsquo;s exactly how to get past it, safely:</p>
+      <ol>
+        <li><strong>Right-click</strong> (or hold Control and click) the app icon.</li>
+        <li>Choose <strong>Open</strong> from the menu that appears.</li>
+        <li>A dialog box will pop up asking if you&rsquo;re sure &mdash; click <strong>Open</strong> again.</li>
+      </ol>
+      <p style="margin:0.75rem 0 0;">
+        That&rsquo;s it. You only ever need to do this once &mdash; after that, the app opens
+        normally, just like anything else on your Mac. This step is standard for
+        open-source apps that aren&rsquo;t distributed through the Mac App Store, and it
+        doesn&rsquo;t mean the app is unsafe.
+      </p>
+    </div>
+  </section>
+
+  <section id="steps">
+    <p class="kicker">Steps 2&ndash;6</p>
+    <h2>Unlocking your drive</h2>
+    <p class="lead">Once the app is open, here&rsquo;s the rest of the process.</p>
+    <ol class="steps">
+      <li>
+        <div>
+          <strong>Plug in your BitLocker drive</strong>
+          <span class="step-detail">
+            Connect the drive to your Mac. The app finds it automatically &mdash; within a
+            few seconds you&rsquo;ll see it appear in the app&rsquo;s drive list. You don&rsquo;t
+            need to click anything to make this happen.
+          </span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Click Unlock and enter your password or recovery key</strong>
+          <span class="step-detail">
+            Select the drive and click <em>Unlock</em>. You&rsquo;ll be asked for either your
+            BitLocker <em>password</em> (the short one you&rsquo;d normally type) or the
+            48-digit <em>recovery key</em> (the long one in groups of six digits). Either works
+            &mdash; just use whichever one you have.
+          </span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Approve the Mac&rsquo;s permission prompt</strong>
+          <span class="step-detail">
+            Your Mac will ask you to confirm using Touch ID or your Mac login password. This is
+            just macOS double-checking that it&rsquo;s really you allowing the app to do this
+            work &mdash; it&rsquo;s normal and safe, the same kind of prompt you&rsquo;d see when
+            installing other software.
+          </span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Wait for it to unlock</strong>
+          <span class="step-detail">
+            You&rsquo;ll see a progress bar. For small drives this is quick; larger drives can
+            take a little while &mdash; that&rsquo;s normal too, just let it run. When it&rsquo;s
+            done, the drive opens in Finder like any regular USB stick.
+          </span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Copy your files</strong>
+          <span class="step-detail">
+            Once it&rsquo;s open in Finder, you can browse it and copy files off exactly like
+            you would with any other USB drive.
+          </span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>When you&rsquo;re done, close up safely</strong>
+          <span class="step-detail">
+            Eject the drive in Finder (or use the app&rsquo;s eject option) before unplugging it
+            &mdash; the same as with any USB drive. The app can also clean up the temporary
+            decrypted copy it made, so nothing sensitive is left behind on your Mac.
+          </span>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section id="troubleshooting">
+    <p class="kicker">Something went wrong?</p>
+    <h2>Quick fixes for common hiccups</h2>
+
+    <details class="faq-item">
+      <summary>The app won&rsquo;t open at all</summary>
+      <p>
+        This usually means the first-open warning got in the way. Right-click (or
+        Control-click) the app icon, choose <strong>Open</strong>, then click
+        <strong>Open</strong> again in the dialog that appears. See the &ldquo;scary warning&rdquo;
+        section above for the full walkthrough.
+      </p>
+    </details>
+
+    <details class="faq-item">
+      <summary>It says my password is wrong</summary>
+      <p>
+        Double-check for typos first &mdash; passwords are case-sensitive. If you&rsquo;re not
+        sure of the password, try the 48-digit recovery key instead; you only need one or the
+        other. The recovery key should be entered as all 48 digits, usually shown in eight
+        groups of six.
+      </p>
+    </details>
+
+    <details class="faq-item">
+      <summary>I don&rsquo;t have the password or recovery key</summary>
+      <p>
+        Being honest: there&rsquo;s no way to open the drive without one of these two. You&rsquo;ll
+        need to ask whoever set up the drive for it, or, if it&rsquo;s tied to a Microsoft
+        account, sign in to that account&rsquo;s BitLocker recovery keys page online to look up
+        the recovery key.
+      </p>
+    </details>
+
+    <details class="faq-item">
+      <summary>The drive doesn&rsquo;t show up in the app</summary>
+      <p>
+        Unplug the drive and plug it back in &mdash; sometimes macOS just needs a second look.
+        If that doesn&rsquo;t help, try a different USB port or cable, especially if you&rsquo;re
+        using an adapter or hub.
+      </p>
+    </details>
+  </section>
+
+  <section id="more-help">
+    <p class="kicker">Need more?</p>
+    <h2>Looking for something more technical?</h2>
+    <p class="lead">
+      This guide covers using the app once it&rsquo;s already on your Mac. If you still need to
+      get the app itself, or you want details on how it works under the hood, the
+      <a href="index.html">main overview page</a> has that, along with build instructions on the
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos">GitHub repository</a>.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-secondary" href="index.html">&larr; Back to overview</a>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-links">
+      <a href="index.html">&larr; Back to overview</a>
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos">GitHub repo</a>
+      <a href="https://github.com/Aorimn/dislocker">dislocker (upstream)</a>
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/blob/main/LICENSE">GPLv2 license</a>
+    </div>
+    <p class="disclaimer">
+      BitLocker on macOS is an independent, community open-source project. Not affiliated with,
+      endorsed by, or sponsored by Microsoft. BitLocker is a trademark of Microsoft Corporation.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
