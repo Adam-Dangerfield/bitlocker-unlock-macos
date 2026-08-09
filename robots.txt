@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://adam-dangerfield.github.io/bitlocker-unlock-macos/sitemap.xml

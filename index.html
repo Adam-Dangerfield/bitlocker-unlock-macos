@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b5fff">
+<title>Open BitLocker Drives on Mac — Free, Open Source (macOS)</title>
+<meta name="description" content="Open BitLocker drives on Mac — free, open-source GUI and CLI for reading BitLocker &amp; BitLocker To Go USB drives on macOS. Built on the dislocker core.">
+<link rel="canonical" href="https://adam-dangerfield.github.io/bitlocker-unlock-macos/">
+
+<!-- Open Graph -->
+<meta property="og:title" content="Open BitLocker Drives on Mac — Free, Open Source">
+<meta property="og:description" content="Free, open-source GUI and CLI to open BitLocker and BitLocker To Go USB drives on macOS. Built on the dislocker core.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://adam-dangerfield.github.io/bitlocker-unlock-macos/">
+<!-- TODO(human): og.png (1200x630) has not been created yet — placeholder reference only, no binary generated. -->
+<meta property="og:image" content="https://adam-dangerfield.github.io/bitlocker-unlock-macos/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:site_name" content="BitLocker on macOS">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Open BitLocker Drives on Mac — Free, Open Source">
+<meta name="twitter:description" content="Free, open-source GUI and CLI to open BitLocker and BitLocker To Go USB drives on macOS. Built on the dislocker core.">
+<meta name="twitter:image" content="https://adam-dangerfield.github.io/bitlocker-unlock-macos/og.png">
+
+<!-- JSON-LD: SoftwareApplication -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "BitLocker on macOS",
+  "alternateName": "bitlocker-unlock-macos",
+  "description": "Open and read BitLocker-encrypted USB drives on macOS, including BitLocker To Go volumes. Free and open source, with a SwiftUI Mac app and a command-line tool built on the dislocker crypto core.",
+  "url": "https://adam-dangerfield.github.io/bitlocker-unlock-macos/",
+  "applicationCategory": "UtilitiesApplication",
+  "operatingSystem": "macOS",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  },
+  "softwareLicense": "https://spdx.org/licenses/GPL-2.0-only.html",
+  "codeRepository": "https://github.com/Adam-Dangerfield/bitlocker-unlock-macos"
+}
+</script>
+
+<!-- JSON-LD: FAQPage -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Can macOS read BitLocker drives?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Not natively. macOS has no built-in support for reading BitLocker-encrypted volumes. BitLocker on macOS adds that support with a free, open-source Mac app and command-line tool."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is BitLocker on macOS free?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. It is free and open source under the GPLv2 license. Today you build it from source; the project is unsigned, so on first launch you'll need to right-click the app and choose Open to bypass Gatekeeper."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does it support BitLocker To Go?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. BitLocker To Go (the exFAT-personality BitLocker format used on removable USB drives) is supported, unlocking with either your password or the 48-digit recovery key."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Do I need a kernel extension to use it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. The default mode (Path A) writes a decrypted image to disk and needs no kernel extension. An optional streaming mode (Path B) uses FUSE-T, a userspace FUSE implementation, so nothing is written to disk and no kernel extension is required either way."
+      }
+    }
+  ]
+}
+</script>
+
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --bg-alt: #f5f7fa;
+    --bg-card: #ffffff;
+    --text: #1a2230;
+    --text-muted: #4a5568;
+    --border: #e2e8f0;
+    --accent: #0b5fff;
+    --accent-ink: #ffffff;
+    --accent-soft: #eaf1ff;
+    --code-bg: #0f172a;
+    --code-text: #e2e8f0;
+    --warn-bg: #fff8e6;
+    --warn-border: #f0c96b;
+    --warn-text: #6b4e00;
+    --focus: #0b5fff;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1220;
+      --bg-alt: #101a2c;
+      --bg-card: #131f33;
+      --text: #e6ecf5;
+      --text-muted: #a3b0c4;
+      --border: #223148;
+      --accent: #5b9dff;
+      --accent-ink: #06122a;
+      --accent-soft: #142a4d;
+      --code-bg: #060b16;
+      --code-text: #d9e2f1;
+      --warn-bg: #2a2308;
+      --warn-border: #6b5613;
+      --warn-text: #ecd489;
+      --focus: #7cb0ff;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 4px rgba(0, 0, 0, 0.5);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    line-height: 1.6;
+    font-size: 17px;
+    overflow-x: hidden;
+  }
+
+  img, svg { max-width: 100%; height: auto; display: block; }
+
+  a { color: var(--accent); text-decoration-thickness: from-font; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible,
+  button:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+  }
+
+  header.site-header {
+    border-bottom: 1px solid var(--border);
+    padding: 1.1rem 0;
+    position: sticky;
+    top: 0;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(180%) blur(8px);
+    z-index: 10;
+  }
+  header.site-header .wrap {
+    max-width: 1040px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-weight: 700;
+    color: var(--text);
+    text-decoration: none;
+    font-size: 1.02rem;
+  }
+  .brand:hover { text-decoration: none; }
+  .brand-mark {
+    width: 1.6rem;
+    height: 1.6rem;
+    border-radius: 6px;
+    background: linear-gradient(135deg, var(--accent), #7cb0ff);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 0.85rem;
+    flex-shrink: 0;
+  }
+  nav.site-nav {
+    display: flex;
+    gap: 1.25rem;
+    font-size: 0.95rem;
+  }
+  nav.site-nav a { color: var(--text-muted); text-decoration: none; }
+  nav.site-nav a:hover { color: var(--accent); }
+
+  main { max-width: 1040px; margin: 0 auto; padding: 0 1.5rem; }
+
+  section { padding: 3.5rem 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: none; }
+
+  .hero { padding-top: 3.75rem; padding-bottom: 3.25rem; }
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 0.3rem 0.7rem;
+    border-radius: 999px;
+    margin-bottom: 1.1rem;
+  }
+
+  h1 {
+    font-size: clamp(2rem, 4.5vw, 2.85rem);
+    line-height: 1.15;
+    margin: 0 0 0.9rem;
+    letter-spacing: -0.02em;
+    max-width: 22ch;
+  }
+  .subhead {
+    font-size: 1.15rem;
+    color: var(--text-muted);
+    max-width: 58ch;
+    margin: 0 0 1.6rem;
+  }
+
+  .cta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.85rem;
+    margin-bottom: 1.1rem;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1.3rem;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.98rem;
+    text-decoration: none;
+    border: 1px solid transparent;
+    transition: transform 0.05s ease, filter 0.15s ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--accent-ink);
+    box-shadow: var(--shadow);
+  }
+  .btn-primary:hover { filter: brightness(1.08); text-decoration: none; }
+  .btn-secondary {
+    background: transparent;
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+
+  .meta-line {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+  }
+
+  .hero-figure {
+    margin-top: 2.5rem;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--bg-alt);
+    padding: 0.75rem;
+    box-shadow: var(--shadow);
+  }
+  .hero-figure img {
+    border-radius: 8px;
+    width: 100%;
+    display: block;
+  }
+  .hero-figure figcaption {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    padding: 0.6rem 0.3rem 0.1rem;
+  }
+
+  h2 {
+    font-size: clamp(1.5rem, 3vw, 1.9rem);
+    letter-spacing: -0.01em;
+    margin: 0 0 1rem;
+  }
+  h3 {
+    font-size: 1.15rem;
+    margin: 0 0 0.5rem;
+  }
+  section > .kicker {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 0 0 0.6rem;
+  }
+  p { color: var(--text); }
+  section p.lead { font-size: 1.05rem; color: var(--text-muted); max-width: 68ch; }
+
+  .problem-box {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem 1.6rem;
+    margin-top: 1.25rem;
+  }
+
+  ol.steps {
+    list-style: none;
+    counter-reset: step;
+    margin: 1.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 1rem;
+  }
+  ol.steps li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 2.4rem 1fr;
+    gap: 0.9rem;
+    align-items: start;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.1rem;
+  }
+  ol.steps li::before {
+    content: counter(step);
+    width: 2.4rem;
+    height: 2.4rem;
+    border-radius: 8px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.05rem;
+  }
+  ol.steps strong { display: block; margin-bottom: 0.15rem; }
+  ol.steps span.step-detail { color: var(--text-muted); font-size: 0.96rem; }
+
+  .modes-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.1rem;
+    margin-top: 1.5rem;
+  }
+  @media (max-width: 720px) {
+    .modes-grid { grid-template-columns: 1fr; }
+  }
+  .mode-card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.4rem 1.5rem;
+    background: var(--bg-card);
+    box-shadow: var(--shadow);
+  }
+  .mode-card h3 { display: flex; align-items: center; gap: 0.5rem; }
+  .badge {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .mode-card ul { margin: 0.75rem 0 0; padding-left: 1.15rem; color: var(--text-muted); }
+  .mode-card li { margin-bottom: 0.4rem; }
+
+  .features-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1.1rem;
+    margin-top: 1.5rem;
+  }
+  .feature-card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.3rem;
+    background: var(--bg-card);
+  }
+  .feature-card h3 { font-size: 1.02rem; }
+  .feature-card p { color: var(--text-muted); font-size: 0.95rem; margin: 0; }
+
+  .code-block {
+    position: relative;
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 10px;
+    margin: 1.25rem 0;
+    box-shadow: var(--shadow);
+  }
+  .code-block pre {
+    margin: 0;
+    padding: 1.1rem 3.4rem 1.1rem 1.2rem;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 0.88rem;
+    line-height: 1.55;
+    -webkit-overflow-scrolling: touch;
+  }
+  .code-block code { white-space: pre; }
+  .copy-btn {
+    position: absolute;
+    top: 0.6rem;
+    right: 0.6rem;
+    background: rgba(255,255,255,0.08);
+    color: var(--code-text);
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 6px;
+    padding: 0.35rem 0.65rem;
+    font-size: 0.78rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .copy-btn:hover { background: rgba(255,255,255,0.16); }
+
+  .install-links {
+    margin-top: 1rem;
+    font-size: 0.97rem;
+  }
+
+  details.faq-item {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.2rem 1.1rem;
+    margin-bottom: 0.75rem;
+    background: var(--bg-card);
+  }
+  details.faq-item summary {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.95rem 0;
+    list-style: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+  }
+  details.faq-item summary::-webkit-details-marker { display: none; }
+  details.faq-item summary::after {
+    content: "+";
+    font-size: 1.3rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    line-height: 1;
+  }
+  details.faq-item[open] summary::after { content: "\2212"; }
+  details.faq-item p { margin: 0 0 1rem; color: var(--text-muted); }
+
+  .security-box {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    color: var(--warn-text);
+    border-radius: 12px;
+    padding: 1.4rem 1.5rem;
+    margin-top: 1.25rem;
+  }
+  .security-box h3 { color: var(--warn-text); margin-top: 0; }
+  .security-box a { color: var(--warn-text); text-decoration-thickness: 2px; }
+  .security-box ul { margin: 0.6rem 0 0; padding-left: 1.2rem; }
+  .security-box li { margin-bottom: 0.4rem; }
+
+  footer.site-footer {
+    background: var(--bg-alt);
+    border-top: 1px solid var(--border);
+    padding: 2.5rem 0 3rem;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+  }
+  footer.site-footer .wrap { max-width: 1040px; }
+  .footer-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.25rem;
+    margin-bottom: 1rem;
+  }
+  .footer-links a { color: var(--text); text-decoration: none; font-weight: 500; }
+  .footer-links a:hover { color: var(--accent); }
+  .disclaimer { max-width: 68ch; }
+
+  .skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    background: var(--accent);
+    color: var(--accent-ink);
+    padding: 0.6rem 1rem;
+    border-radius: 0 0 8px 0;
+    z-index: 100;
+  }
+  .skip-link:focus { left: 0; }
+
+  @media (max-width: 600px) {
+    section { padding: 2.4rem 0; }
+    body { font-size: 16px; }
+    nav.site-nav { display: none; }
+  }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <span class="brand-mark" aria-hidden="true">🔓</span>
+      BitLocker on macOS
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a href="#how-it-works">How it works</a>
+      <a href="#modes">Modes</a>
+      <a href="#install">Install</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero" id="top">
+    <div class="wrap" style="padding:0;max-width:100%;">
+      <p class="eyebrow">Free &middot; Open Source &middot; dislocker-powered</p>
+      <h1>Open BitLocker Drives on Mac</h1>
+      <p class="subhead">
+        A free, open-source Mac app and command-line tool for reading BitLocker-encrypted
+        USB drives on macOS &mdash; including BitLocker To Go volumes formatted on Windows.
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos">
+          View on GitHub
+        </a>
+        <a class="btn btn-secondary" href="#how-it-works">How it works</a>
+      </div>
+      <p class="meta-line">Free &middot; Open source &middot; GPLv2</p>
+
+      <figure class="hero-figure">
+        <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 675'%3E%3Crect width='1200' height='675' fill='%23e2e8f0'/%3E%3C/svg%3E"
+             alt="Screenshot of the BitLocker on macOS app showing a detected BitLocker USB drive with an Unlock button, ready to enter a password or recovery key">
+        <figcaption>App screenshot placeholder &mdash; replace with a real screenshot of the unlock flow.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="problem">
+    <p class="kicker">The problem</p>
+    <h2>macOS can&rsquo;t open BitLocker drives on its own</h2>
+    <div class="problem-box">
+      <p style="margin:0;">
+        Plug a BitLocker-encrypted USB drive &mdash; including a <strong>BitLocker To Go</strong>
+        drive created on Windows &mdash; into a Mac, and Finder either shows nothing usable or
+        refuses to mount it. macOS has no native BitLocker support, so files that open fine on
+        Windows are simply inaccessible. <strong>BitLocker on macOS</strong> fixes that: it reads
+        BitLocker and BitLocker To Go volumes on macOS using your password or 48-digit recovery
+        key, no Windows machine required.
+      </p>
+    </div>
+  </section>
+
+  <section id="how-it-works">
+    <p class="kicker">How it works</p>
+    <h2>From plugged in to mounted in Finder</h2>
+    <p class="lead">The Mac app walks through five steps to unlock a BitLocker USB drive:</p>
+    <ol class="steps">
+      <li>
+        <div>
+          <strong>Plug in your BitLocker USB drive</strong>
+          <span class="step-detail">The app auto-detects BitLocker volumes via macOS DiskArbitration as soon as the drive is connected.</span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Click Unlock</strong>
+          <span class="step-detail">The detected drive appears in the app, ready to unlock.</span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Enter your password or recovery key</strong>
+          <span class="step-detail">Use your BitLocker password, or the 48-digit numerical recovery key.</span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Approve the macOS admin prompt</strong>
+          <span class="step-detail">Authorize with Touch ID or your Mac password &mdash; required for the privileged helper that performs the unlock.</span>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>The volume mounts in Finder</strong>
+          <span class="step-detail">Browse, copy, and work with your files exactly like any other mounted drive.</span>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section id="modes">
+    <p class="kicker">Two unlock modes</p>
+    <h2>Decrypted image vs. FUSE-T streaming</h2>
+    <p class="lead">
+      BitLocker on macOS supports two ways to get at your files, so you can pick the trade-off
+      that fits your situation.
+    </p>
+    <div class="modes-grid">
+      <div class="mode-card">
+        <h3>Path A <span class="badge">Default</span></h3>
+        <p style="color:var(--text-muted);margin:0.25rem 0 0;">Writes a fully decrypted image to disk.</p>
+        <ul>
+          <li>Portable &mdash; works with no extra dependencies</li>
+          <li>Straightforward Finder mount of a full disk image</li>
+          <li>Needs free disk space equal to the drive&rsquo;s used data</li>
+          <li>Leaves a decrypted image on disk &mdash; treat it as sensitive (see Security note below)</li>
+        </ul>
+      </div>
+      <div class="mode-card">
+        <h3>Path B <span class="badge">Optional</span></h3>
+        <p style="color:var(--text-muted);margin:0.25rem 0 0;">Streams the volume via FUSE-T.</p>
+        <ul>
+          <li>Nothing decrypted is written to disk</li>
+          <li>Good when disk space is tight or you only need a few files</li>
+          <li>Uses FUSE-T, a userspace FUSE implementation &mdash; no kernel extension</li>
+          <li>Requires installing FUSE-T as an extra dependency</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="features">
+    <p class="kicker">Features</p>
+    <h2>What you get</h2>
+    <div class="features-grid">
+      <div class="feature-card">
+        <h3>GUI + CLI</h3>
+        <p>A SwiftUI Mac app for point-and-click unlocking, plus a command-line tool for scripting and headless use.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Auto-detection</h3>
+        <p>BitLocker volumes are found automatically via macOS DiskArbitration as soon as they&rsquo;re connected.</p>
+      </div>
+      <div class="feature-card">
+        <h3>BitLocker To Go support</h3>
+        <p>Reads the exFAT-personality BitLocker format used on Windows-formatted removable drives.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Password or recovery key</h3>
+        <p>Unlock with your BitLocker password, or the 48-digit numerical recovery key.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Built on dislocker</h3>
+        <p>Both interfaces are backed by the well-tested <a href="https://github.com/Aorimn/dislocker">dislocker</a> crypto core.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Free &amp; open source</h3>
+        <p>Licensed under GPLv2. Inspect the source, build it yourself, contribute back.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <p class="kicker">Install</p>
+    <h2>Get started</h2>
+    <p class="lead">
+      Today, installing means building from source. You&rsquo;ll need Homebrew with
+      <code>cmake</code>, <code>pkg-config</code>, and <code>mbedtls@3</code> (must be v3);
+      Python 3 and Swift ship with macOS and the Xcode Command Line Tools. FUSE-T is optional,
+      only needed for Path B streaming.
+    </p>
+    <div class="code-block">
+      <pre><code id="clone-cmd">git clone --recurse-submodules https://github.com/Adam-Dangerfield/bitlocker-unlock-macos.git</code></pre>
+      <button class="copy-btn" type="button" data-copy-target="clone-cmd">Copy</button>
+    </div>
+    <p class="install-links">
+      Full build steps, dependency install commands, and troubleshooting live in the
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos#readme">project README</a>.
+    </p>
+  </section>
+
+  <section id="faq">
+    <p class="kicker">FAQ</p>
+    <h2>Frequently asked questions</h2>
+
+    <details class="faq-item">
+      <summary>Can macOS read BitLocker drives?</summary>
+      <p>Not natively. macOS has no built-in support for reading BitLocker-encrypted volumes. BitLocker on macOS adds that support with a free, open-source Mac app and command-line tool.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>Is this free?</summary>
+      <p>Yes. It&rsquo;s free and open source under the GPLv2 license. Today you build it from source; the project is unsigned, so on first launch you&rsquo;ll need to right-click the app and choose Open to bypass Gatekeeper.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>Does it support BitLocker To Go?</summary>
+      <p>Yes. BitLocker To Go (the exFAT-personality BitLocker format used on removable USB drives) is supported, unlocking with either your password or the 48-digit recovery key.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>Do I need a kernel extension?</summary>
+      <p>No. The default mode (Path A) writes a decrypted image to disk and needs no kernel extension. The optional streaming mode (Path B) uses FUSE-T, a userspace FUSE implementation, so no kernel extension is required either way.</p>
+    </details>
+  </section>
+
+  <section id="security">
+    <p class="kicker">Security note</p>
+    <h2>Honest about the trade-offs</h2>
+    <div class="security-box">
+      <h3>Single-user threat model</h3>
+      <ul>
+        <li>This tool is designed for a single-user Mac, not a shared or multi-user machine.</li>
+        <li>Path A writes a plaintext decrypted image to <code>/private/tmp/bl</code> &mdash; treat that path as sensitive while it exists. Path B (FUSE-T streaming) avoids writing on-disk plaintext.</li>
+        <li>A security review has been completed and CRITICAL/HIGH findings have been remediated, with the exception of code signing.</li>
+        <li>The app is intentionally unsigned right now; code signing and notarization are on the roadmap, alongside a native binary rewrite.</li>
+      </ul>
+      <p style="margin-top:1rem;">
+        Read the full write-up in the
+        <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/tree/main/docs">repository&rsquo;s security docs</a>.
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-links">
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos">GitHub repo</a>
+      <a href="https://github.com/Aorimn/dislocker">dislocker (upstream)</a>
+      <a href="https://github.com/Adam-Dangerfield/bitlocker-unlock-macos/blob/main/LICENSE">GPLv2 license</a>
+    </div>
+    <p class="disclaimer">
+      BitLocker on macOS is an independent, community open-source project. Not affiliated with,
+      endorsed by, or sponsored by Microsoft. BitLocker is a trademark of Microsoft Corporation.
+    </p>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var targetId = btn.getAttribute('data-copy-target');
+      var el = document.getElementById(targetId);
+      if (!el) return;
+      var text = el.textContent;
+      var done = function () {
+        var original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(function () { btn.textContent = original; }, 1600);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var range = document.createRange();
+        range.selectNode(el);
+        window.getSelection().removeAllRanges();
+        window.getSelection().addRange(range);
+        try { document.execCommand('copy'); } catch (e) {}
+        window.getSelection().removeAllRanges();
+        done();
+      }
+    });
+  });
+</script>
+
+</body>
+</html>
