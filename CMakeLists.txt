@@ -54,6 +54,13 @@ else()
                    "Install fuse-t (`brew install --cask fuse-t`) to enable.")
 endif()
 
+# ---------- testing ----------
+# enable_testing() MUST run in the ROOT scope so CTest writes CTestTestfile.cmake
+# at the build root — otherwise `ctest` run from the build root reports
+# "No tests were found" even though tests/ registered them. include(CTest)
+# calls enable_testing() and adds the BUILD_TESTING option.
+include(CTest)
+
 # ---------- subdirs ----------
 add_subdirectory(src/bitlocker-crypto)
 if(HAVE_FUSE AND (BUILD_MACOS_FUSE STREQUAL "AUTO" OR BUILD_MACOS_FUSE))
