@@ -579,6 +579,20 @@ or `dislocker-fuse` as root) and an unprivileged orchestrator.  Issue one
 a privileged XPC helper with a signed entitlement, which provides a per-command
 authorisation model and binary identity verification.
 
+**Status (2026-11-01):** Mitigated for `unlock`. When `bl-helper` is installed,
+the app uses it for unlock (PR #14). In the legacy fallback, the app now runs
+`bl unlock` unprivileged with `BL_ELEVATE=osascript`, and `bl` elevates only
+`dislocker-file` through one `do shell script`. That command is built inline
+from validated, shell-quoted parts, so no script file and no Python run as
+root. The image is pre-created as the user, so no `chown` is needed afterwards.
+Still open:
+- `bl mount` (the legacy Path B fallback) still runs entirely under osascript.
+- The root command executes binaries that live in user-writable locations.
+  This is the same exposure the earlier design had, and it is tracked under
+  F3-05 and F7-01.
+- Cancelling stops osascript, but the root `dislocker-file` process may keep
+  running until it finishes.
+
 ---
 
 ### F3-05 — MEDIUM (P2) — Unsigned bundle; no binary integrity check before root execution

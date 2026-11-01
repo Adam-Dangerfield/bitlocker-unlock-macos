@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import errno
 import fcntl
 import getpass
@@ -65,6 +66,7 @@ import plistlib
 import pty
 import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -832,6 +834,73 @@ def _build_dislocker_args(secret: Secret, device: str, *,
     return base
 
 
+# ---------- scoped GUI elevation (F3-04) ----------
+#
+# The app's legacy fallback used to run the *entire* `bl unlock` as root via one
+# `osascript ... with administrator privileges`: device probing, /tmp/bl
+# management, the progress loop and hdiutil all ran as root for the whole
+# multi-minute decrypt. Now the app runs bl unprivileged with
+# BL_ELEVATE=osascript, and bl elevates exactly one command — dislocker-file —
+# built inline from validated, shell-quoted parts. No intermediate script file
+# is executed as root, and no Python runs as root.
+
+# Anything embedded in the `do shell script "..."` string must be free of
+# characters that could break out of the POSIX single-quoting or the
+# AppleScript string literal (cf. isSafeForShellEmbed in BackendBridge.swift).
+_UNSAFE_EMBED_RE = re.compile(r"['\"\\\x00-\x1f\x7f]")
+
+
+def _use_osascript_elevation() -> bool:
+    """True when bl is unprivileged and the host app asked for GUI elevation."""
+    return (os.geteuid() != 0
+            and os.environ.get("BL_ELEVATE", "").strip().lower() == "osascript")
+
+
+def _osascript_command(argv: list[str], *, stdin_path: Optional[str],
+                       json_mode: bool) -> list[str]:
+    """Build the osascript argv that runs ``argv`` (only) as root.
+
+    Every element is checked against _UNSAFE_EMBED_RE, then shlex-quoted.
+    dislocker's output is merged into the do-shell-script result, which
+    osascript prints to its own stdout — the caller wires that to the
+    user-owned log, so root never opens a log path. If ``stdin_path`` is given,
+    the root shell redirects dislocker's stdin from it (the secret file).
+    """
+    parts = list(argv) + ([stdin_path] if stdin_path else [])
+    for p in parts:
+        if _UNSAFE_EMBED_RE.search(p):
+            fail("UNSAFE_PATH",
+                 "refusing to elevate: argument contains quote, backslash or "
+                 "control characters",
+                 json_mode=json_mode)
+    cmd = " ".join(shlex.quote(a) for a in argv)
+    if stdin_path:
+        cmd += " < " + shlex.quote(stdin_path)
+    cmd += " 2>&1"
+    return ["/usr/bin/osascript", "-e",
+            f'do shell script "{cmd}" with administrator privileges']
+
+
+def _stage_secret_for_root(secret: Secret, *, json_mode: bool) -> Optional[str]:
+    """Write a password/recovery secret to a fresh 0600 file in IMG_DIR.
+
+    The root shell feeds it to dislocker's stdin, so the secret never reaches
+    argv or the AppleScript string. The caller unlinks it as soon as dislocker
+    has consumed it; atexit is the backstop. Returns None for BEK secrets.
+    """
+    if secret.kind == "bek":
+        return None
+    if secret.value is None:
+        fail("BAD_SECRET", "secret has no value to stage", json_mode=json_mode)
+    fd, path = tempfile.mkstemp(prefix="sec-", dir=str(IMG_DIR))
+    try:
+        os.write(fd, secret.value + b"\n")
+    finally:
+        os.close(fd)
+    atexit.register(_unlink_quiet, path)
+    return path
+
+
 # ---------- subcommands ----------
 
 def cmd_detect(args) -> int:
@@ -858,6 +927,9 @@ def _dislocker_failure(rc: int, tail: list) -> tuple:
     guidance instead of a bare exit code.
     """
     joined = "\n".join(tail)
+    if "(-128)" in joined:
+        # osascript: the user dismissed the administrator password dialog.
+        return ("CANCELLED", "administrator authentication was cancelled")
     if "Operation not permitted" in joined or "Failed to open" in joined:
         return ("NEEDS_DISK_ACCESS",
                 "macOS denied raw disk access. This requires Full Disk Access. "
@@ -918,9 +990,14 @@ def cmd_unlock(args) -> int:
         emit({"mountPath": mount_path}, json_mode=args.json)
         return 0
 
+    # F3-04: the app's legacy fallback runs bl unprivileged and asks for GUI
+    # elevation of dislocker-file alone; there is no sudo ticket to keep warm.
+    gui_elevate = _use_osascript_elevation()
+    sec_path: Optional[str] = None
+
     # Privilege escalation + log file setup. The keepalive context manager
     # guarantees the refresher child is killed on every exit path (F3-01).
-    with SudoKeepalive():
+    with (contextlib.nullcontext() if gui_elevate else SudoKeepalive()):
         # F1-05 / F5-05: open log with explicit 0600.
         try:
             os.unlink(str(LOG_FILE))
@@ -938,9 +1015,30 @@ def cmd_unlock(args) -> int:
 
         dargs = _build_dislocker_args(secret, args.device, tail=[str(out_path)])
         try:
-            proc = _spawn_dislocker(
-                DISLOCKER_FILE, dargs, secret.value, log_fd, use_pty=True,
-            )
+            if gui_elevate:
+                # Pre-create the image as the user. dislocker-file opens it
+                # O_CREAT|O_RDWR (no O_EXCL / O_TRUNC), so root writes into a
+                # user-owned file and nothing needs chowning afterwards.
+                _unlink_quiet(str(out_path))
+                os.close(os.open(str(out_path),
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600))
+                sec_path = _stage_secret_for_root(secret, json_mode=args.json)
+                _assert_no_verbose(dargs)
+                # osascript's stdout carries dislocker's output (2>&1 inside
+                # the root shell) into the user-owned log fd.
+                proc = subprocess.Popen(
+                    _osascript_command([str(DISLOCKER_FILE), *dargs],
+                                       stdin_path=sec_path, json_mode=args.json),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_fd,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
+            else:
+                proc = _spawn_dislocker(
+                    DISLOCKER_FILE, dargs, secret.value, log_fd, use_pty=True,
+                )
         finally:
             # Parent no longer needs the log fd directly (the child has it).
             try:
@@ -954,6 +1052,8 @@ def cmd_unlock(args) -> int:
         window = 5.0  # seconds for rate average
 
         def handle_sigint(_sig, _frm):
+            # Under GUI elevation this stops osascript; the root dislocker
+            # child it spawned may run on until it finishes or fails.
             proc.terminate()
             raise KeyboardInterrupt()
         signal.signal(signal.SIGINT, handle_sigint)
@@ -961,6 +1061,11 @@ def cmd_unlock(args) -> int:
         try:
             while proc.poll() is None:
                 cur = out_path.stat().st_size if out_path.exists() else 0
+                # dislocker reads the secret before it writes any image data,
+                # so the staged copy can go as soon as the image starts growing.
+                if sec_path and cur > 0:
+                    _unlink_quiet(sec_path)
+                    sec_path = None
                 now = time.monotonic()
                 samples.append((now, cur))
                 samples[:] = [s for s in samples if now - s[0] <= window]
@@ -983,6 +1088,9 @@ def cmd_unlock(args) -> int:
             fail("CANCELLED", "user cancelled", json_mode=args.json)
 
         rc = proc.wait()
+        if sec_path:
+            _unlink_quiet(sec_path)
+            sec_path = None
         if rc != 0:
             # F6-01: only include log tail in non-JSON mode and behind a flag-ish
             # gate; in JSON mode (UI path) return a short generic message.

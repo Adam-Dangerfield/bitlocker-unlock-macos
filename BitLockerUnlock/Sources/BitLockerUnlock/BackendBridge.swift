@@ -98,12 +98,12 @@ public final class BackendBridge: @unchecked Sendable {
         return legacyUnlock(device: device, method: method)
     }
 
-    /// `./bl unlock --device DEV ... --json` via osascript (legacy fallback).
+    /// `./bl unlock --device DEV ... --json` (legacy fallback).
     ///
-    /// Streams `UnlockEvent` values. Implementation note: because osascript
-    /// blocks, we cannot read NDJSON line-by-line from stdout — we get the
-    /// whole blob at the end. We bridge the gap by polling the output image
-    /// every 500ms to emit synthetic `.progress` events.
+    /// Streams `UnlockEvent` values. bl runs unprivileged and elevates only
+    /// dislocker-file via osascript (F3-04). We capture bl's stdout as one
+    /// blob at the end and bridge the gap by polling the output image every
+    /// 500ms to emit synthetic `.progress` events.
     ///
     /// SECURITY (F1-02): The secret is written to a 0600 temp file and passed
     /// via `--secret-file`; it is never placed in argv or the shell command string.
@@ -146,13 +146,24 @@ public final class BackendBridge: @unchecked Sendable {
                     }
                 }
 
-                // Kick off the privileged osascript work in parallel with a
-                // progress-poll loop.
+                // F3-04: run `bl unlock` UNPRIVILEGED in parallel with a
+                // progress-poll loop. BL_ELEVATE=osascript makes bl elevate
+                // only dislocker-file (one admin prompt) instead of the app
+                // granting root to the whole bl run.
                 let runTask = Task.detached { () -> (exit: Int32, stdout: String, stderr: String) in
-                    return await self.runOsascriptBL(
-                        subcommand: "unlock",
-                        extraArgs: ["--device", device] + secretArgs + ["--json"]
-                    )
+                    var env = self.blEnv()
+                    env["BL_ELEVATE"] = "osascript"
+                    do {
+                        let r = try await self.runProcess(
+                            executable: "/usr/bin/env",
+                            args: ["python3", self.blPath, "unlock", "--device", device]
+                                + secretArgs + ["--json"],
+                            extraEnv: env
+                        )
+                        return (r.exitCode, r.stdout, r.stderr)
+                    } catch {
+                        return (-1, "", "spawn error: \(error.localizedDescription)")
+                    }
                 }
 
                 // Progress poller. Emits .progress periodically until the
