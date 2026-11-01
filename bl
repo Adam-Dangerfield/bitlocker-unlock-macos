@@ -857,6 +857,7 @@ def _use_osascript_elevation() -> bool:
 
 
 def _osascript_command(argv: list[str], *, stdin_path: Optional[str],
+                       not_symlink: Optional[str] = None,
                        json_mode: bool) -> list[str]:
     """Build the osascript argv that runs ``argv`` (only) as root.
 
@@ -865,8 +866,11 @@ def _osascript_command(argv: list[str], *, stdin_path: Optional[str],
     osascript prints to its own stdout — the caller wires that to the
     user-owned log, so root never opens a log path. If ``stdin_path`` is given,
     the root shell redirects dislocker's stdin from it (the secret file).
+    If ``not_symlink`` is given, the root shell re-checks it is not a symlink
+    immediately before running ``argv`` — the auth dialog can sit open for
+    minutes after bl's own check.
     """
-    parts = list(argv) + ([stdin_path] if stdin_path else [])
+    parts = list(argv) + [p for p in (stdin_path, not_symlink) if p]
     for p in parts:
         if _UNSAFE_EMBED_RE.search(p):
             fail("UNSAFE_PATH",
@@ -874,6 +878,8 @@ def _osascript_command(argv: list[str], *, stdin_path: Optional[str],
                  "control characters",
                  json_mode=json_mode)
     cmd = " ".join(shlex.quote(a) for a in argv)
+    if not_symlink:
+        cmd = f"test ! -L {shlex.quote(not_symlink)} && {cmd}"
     if stdin_path:
         cmd += " < " + shlex.quote(stdin_path)
     cmd += " 2>&1"
@@ -951,7 +957,8 @@ def cmd_unlock(args) -> int:
     # F2-02: --out PATH must resolve under IMG_DIR (no arbitrary root-write).
     # Check this FIRST, before any device probing or secret prompting, so a
     # path-traversal attempt is rejected with a clear error.
-    out_path = Path(args.out) if args.out else DEFAULT_IMAGE
+    # Absolute, so it means the same thing to an elevated shell whose cwd is /.
+    out_path = Path(os.path.abspath(args.out)) if args.out else DEFAULT_IMAGE
     if not _safe_under(out_path, IMG_DIR):
         fail("UNSAFE_PATH",
              f"--out must resolve under {IMG_DIR} (got {out_path})",
@@ -1029,7 +1036,9 @@ def cmd_unlock(args) -> int:
                 # the root shell) into the user-owned log fd.
                 proc = subprocess.Popen(
                     _osascript_command([str(DISLOCKER_FILE), *dargs],
-                                       stdin_path=sec_path, json_mode=args.json),
+                                       stdin_path=sec_path,
+                                       not_symlink=str(out_path),
+                                       json_mode=args.json),
                     stdin=subprocess.DEVNULL,
                     stdout=log_fd,
                     stderr=subprocess.STDOUT,
@@ -1057,6 +1066,10 @@ def cmd_unlock(args) -> int:
             proc.terminate()
             raise KeyboardInterrupt()
         signal.signal(signal.SIGINT, handle_sigint)
+        # SIGTERM (e.g. the app being force-quit) would otherwise skip atexit
+        # and leave the staged secret file behind; route it through the same
+        # cleanup as Ctrl-C.
+        signal.signal(signal.SIGTERM, handle_sigint)
 
         try:
             while proc.poll() is None:
@@ -1085,6 +1098,9 @@ def cmd_unlock(args) -> int:
                 }, json_mode=args.json, stream=True)
                 time.sleep(1.0)
         except KeyboardInterrupt:
+            # A partial image would be mistaken for a finished one by the
+            # skip-if-present check on the next run.
+            _unlink_quiet(str(out_path))
             fail("CANCELLED", "user cancelled", json_mode=args.json)
 
         rc = proc.wait()
@@ -1100,6 +1116,7 @@ def cmd_unlock(args) -> int:
                 tail = []
             code, short = _dislocker_failure(rc, tail)
             full = short + ("\ntail:\n" + "\n".join(tail) if tail else "")
+            _unlink_quiet(str(out_path))  # partial image: see the cancel path
             fail(code, short if args.json else full, json_mode=args.json)
 
         # final 100% paint

@@ -401,11 +401,26 @@ public final class BackendBridge: @unchecked Sendable {
             proc.standardOutput = outPipe
             proc.standardError  = errPipe
 
+            // Drain both pipes while the child runs. Reading only at exit lets
+            // a long-running child (e.g. `bl unlock` streaming one progress
+            // line per second) fill the pipe buffer and block forever.
+            let outBuf = LockedBuffer()
+            let errBuf = LockedBuffer()
+            outPipe.fileHandleForReading.readabilityHandler = { h in
+                outBuf.append(h.availableData)
+            }
+            errPipe.fileHandleForReading.readabilityHandler = { h in
+                errBuf.append(h.availableData)
+            }
+
             proc.terminationHandler = { p in
-                let out = String(data: (try? outPipe.fileHandleForReading.readToEnd()) ?? Data(),
-                                 encoding: .utf8) ?? ""
-                let err = String(data: (try? errPipe.fileHandleForReading.readToEnd()) ?? Data(),
-                                 encoding: .utf8) ?? ""
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                // Pick up anything written after the last handler callback.
+                outBuf.append((try? outPipe.fileHandleForReading.readToEnd()) ?? Data())
+                errBuf.append((try? errPipe.fileHandleForReading.readToEnd()) ?? Data())
+                let out = String(data: outBuf.data, encoding: .utf8) ?? ""
+                let err = String(data: errBuf.data, encoding: .utf8) ?? ""
                 continuation.resume(returning: RunResult(
                     exitCode: p.terminationStatus,
                     stdout: out,
@@ -757,5 +772,20 @@ public final class BackendBridge: @unchecked Sendable {
             }
         }
         return nil
+    }
+}
+
+/// Byte buffer appended to from a pipe's readabilityHandler (any thread).
+private final class LockedBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func append(_ chunk: Data) {
+        lock.lock(); storage.append(chunk); lock.unlock()
+    }
+
+    var data: Data {
+        lock.lock(); defer { lock.unlock() }
+        return storage
     }
 }
