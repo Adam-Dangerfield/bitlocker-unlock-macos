@@ -1,0 +1,40 @@
+diff --git a/src/dislocker-fuse.c b/src/dislocker-fuse.c
+index 02112f1..0534b85 100644
+--- a/src/dislocker-fuse.c
++++ b/src/dislocker-fuse.c
+@@ -54,7 +54,7 @@ dis_context_t dis_ctx;
+ /**
+  * Stubs used for FUSE operations.
+  */
+-#ifdef __APPLE__
++#if defined(__APPLE__) && defined(DIS_FUSE_DARWIN_API)
+ static int fs_getattr(const char *path, struct fuse_darwin_attr *stbuf,
+                       struct fuse_file_info *fi)
+ #else
+@@ -71,7 +71,7 @@ static int fs_getattr(const char *path, struct stat *stbuf,
+ 	memset(stbuf, 0, sizeof(*stbuf));
+ 	if(strcmp(path, "/") == 0)
+ 	{
+-#ifdef __APPLE__
++#if defined(__APPLE__) && defined(DIS_FUSE_DARWIN_API)
+ 		stbuf->mode = S_IFDIR | 0555;
+ 		stbuf->nlink = 2;
+ #else
+@@ -82,7 +82,7 @@ static int fs_getattr(const char *path, struct stat *stbuf,
+ 	else if(strcmp(path, NTFS_FILERELATIVEPATH) == 0)
+ 	{
+ 		mode_t m = dis_is_read_only(dis_ctx) ? 0444 : 0666;
+-#ifdef __APPLE__
++#if defined(__APPLE__) && defined(DIS_FUSE_DARWIN_API)
+ 		stbuf->mode = S_IFREG | m;
+ 		stbuf->nlink = 1;
+ 		stbuf->size = (off_t)dis_inouts_volume_size(dis_ctx);
+@@ -98,7 +98,7 @@ static int fs_getattr(const char *path, struct stat *stbuf,
+ 	return res;
+ }
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && defined(DIS_FUSE_DARWIN_API)
+ static int fs_readdir(const char *path, void *buf, fuse_darwin_fill_dir_t filler,
+                       off_t offset, struct fuse_file_info *fi,
+                       enum fuse_readdir_flags flags)

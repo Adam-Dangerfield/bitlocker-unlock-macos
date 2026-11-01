@@ -85,6 +85,34 @@ if git -C "$DISLOCKER_DIR" symbolic-ref -q HEAD >/dev/null 2>&1; then
     || echo "warning: could not detach dislocker HEAD; VERSION_DBG may vary" >&2
 fi
 
+# ---------- local patches to the pinned tree ----------
+# Reviewed, in-repo patches in third_party/patches/ are applied for the
+# duration of the build and reverted on exit, so the submodule stays clean
+# at the pinned SHA.
+#   0001: upstream v0.7.4 uses macFUSE 5's fuse_darwin_* API on __APPLE__;
+#         FUSE-T only provides the plain libfuse3 API. The patch gates the
+#         darwin branch behind DIS_FUSE_DARWIN_API (never defined here).
+PATCH_DIR="$SCRIPT_DIR/third_party/patches"
+APPLIED_PATCHES=()
+revert_patches() {
+  local i
+  for (( i=${#APPLIED_PATCHES[@]}-1; i>=0; i-- )); do
+    git -C "$DISLOCKER_DIR" apply -R "${APPLIED_PATCHES[$i]}" \
+      || echo "warning: could not revert ${APPLIED_PATCHES[$i]}" >&2
+  done
+}
+trap revert_patches EXIT
+for p in "$PATCH_DIR"/*.patch; do
+  [[ -f "$p" ]] || continue
+  if ! git -C "$DISLOCKER_DIR" apply --check "$p" 2>/dev/null; then
+    echo "error: patch $(basename "$p") does not apply to the pinned dislocker." >&2
+    echo "       (Already applied? Run: git -C third_party/dislocker checkout -- .)" >&2
+    exit 1
+  fi
+  git -C "$DISLOCKER_DIR" apply "$p" && APPLIED_PATCHES+=("$p")
+  echo "applied patch: $(basename "$p")"
+done
+
 # ---------- F7-04: mbedtls@3 (required) — version must be v3.x ----------
 MBEDTLS_PREFIX="$(brew --prefix mbedtls@3 2>/dev/null || true)"
 if [[ -z "$MBEDTLS_PREFIX" ]]; then
