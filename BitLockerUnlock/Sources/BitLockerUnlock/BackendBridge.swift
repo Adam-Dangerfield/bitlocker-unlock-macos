@@ -98,12 +98,12 @@ public final class BackendBridge: @unchecked Sendable {
         return legacyUnlock(device: device, method: method)
     }
 
-    /// `./bl unlock --device DEV ... --json` via osascript (legacy fallback).
+    /// `./bl unlock --device DEV ... --json` (legacy fallback).
     ///
-    /// Streams `UnlockEvent` values. Implementation note: because osascript
-    /// blocks, we cannot read NDJSON line-by-line from stdout — we get the
-    /// whole blob at the end. We bridge the gap by polling the output image
-    /// every 500ms to emit synthetic `.progress` events.
+    /// Streams `UnlockEvent` values. bl runs unprivileged and elevates only
+    /// dislocker-file via osascript (F3-04). We capture bl's stdout as one
+    /// blob at the end and bridge the gap by polling the output image every
+    /// 500ms to emit synthetic `.progress` events.
     ///
     /// SECURITY (F1-02): The secret is written to a 0600 temp file and passed
     /// via `--secret-file`; it is never placed in argv or the shell command string.
@@ -146,13 +146,24 @@ public final class BackendBridge: @unchecked Sendable {
                     }
                 }
 
-                // Kick off the privileged osascript work in parallel with a
-                // progress-poll loop.
+                // F3-04: run `bl unlock` UNPRIVILEGED in parallel with a
+                // progress-poll loop. BL_ELEVATE=osascript makes bl elevate
+                // only dislocker-file (one admin prompt) instead of the app
+                // granting root to the whole bl run.
                 let runTask = Task.detached { () -> (exit: Int32, stdout: String, stderr: String) in
-                    return await self.runOsascriptBL(
-                        subcommand: "unlock",
-                        extraArgs: ["--device", device] + secretArgs + ["--json"]
-                    )
+                    var env = self.blEnv()
+                    env["BL_ELEVATE"] = "osascript"
+                    do {
+                        let r = try await self.runProcess(
+                            executable: "/usr/bin/env",
+                            args: ["python3", self.blPath, "unlock", "--device", device]
+                                + secretArgs + ["--json"],
+                            extraEnv: env
+                        )
+                        return (r.exitCode, r.stdout, r.stderr)
+                    } catch {
+                        return (-1, "", "spawn error: \(error.localizedDescription)")
+                    }
                 }
 
                 // Progress poller. Emits .progress periodically until the
@@ -390,11 +401,26 @@ public final class BackendBridge: @unchecked Sendable {
             proc.standardOutput = outPipe
             proc.standardError  = errPipe
 
+            // Drain both pipes while the child runs. Reading only at exit lets
+            // a long-running child (e.g. `bl unlock` streaming one progress
+            // line per second) fill the pipe buffer and block forever.
+            let outBuf = LockedBuffer()
+            let errBuf = LockedBuffer()
+            outPipe.fileHandleForReading.readabilityHandler = { h in
+                outBuf.append(h.availableData)
+            }
+            errPipe.fileHandleForReading.readabilityHandler = { h in
+                errBuf.append(h.availableData)
+            }
+
             proc.terminationHandler = { p in
-                let out = String(data: (try? outPipe.fileHandleForReading.readToEnd()) ?? Data(),
-                                 encoding: .utf8) ?? ""
-                let err = String(data: (try? errPipe.fileHandleForReading.readToEnd()) ?? Data(),
-                                 encoding: .utf8) ?? ""
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                // Pick up anything written after the last handler callback.
+                outBuf.append((try? outPipe.fileHandleForReading.readToEnd()) ?? Data())
+                errBuf.append((try? errPipe.fileHandleForReading.readToEnd()) ?? Data())
+                let out = String(data: outBuf.data, encoding: .utf8) ?? ""
+                let err = String(data: errBuf.data, encoding: .utf8) ?? ""
                 continuation.resume(returning: RunResult(
                     exitCode: p.terminationStatus,
                     stdout: out,
@@ -746,5 +772,20 @@ public final class BackendBridge: @unchecked Sendable {
             }
         }
         return nil
+    }
+}
+
+/// Byte buffer appended to from a pipe's readabilityHandler (any thread).
+private final class LockedBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func append(_ chunk: Data) {
+        lock.lock(); storage.append(chunk); lock.unlock()
+    }
+
+    var data: Data {
+        lock.lock(); defer { lock.unlock() }
+        return storage
     }
 }
