@@ -13,7 +13,12 @@ private struct WindowGuard: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let v = NSView()
         DispatchQueue.main.async {
-            v.window?.sharingType = .none
+            // Screenshot escape hatch: set BLU_ALLOW_CAPTURE=1 to permit screen
+            // capture for producing marketing screenshots. Protection stays ON
+            // by default (F6-03) for every normal launch.
+            if ProcessInfo.processInfo.environment["BLU_ALLOW_CAPTURE"] != "1" {
+                v.window?.sharingType = .none
+            }
         }
         return v
     }

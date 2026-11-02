@@ -100,6 +100,21 @@ The `--secret-file PATH --secret-type T` protocol routes the BitLocker secret th
 
 A full security review lives at [docs/security/SECURITY_REVIEW_2026-05-18.md](docs/security/SECURITY_REVIEW_2026-05-18.md). All CRITICAL and HIGH findings except code-signing have been remediated; the remediation history is preserved in git. The remaining backlog (MEDIUM/LOW) is tracked as open issues. Threat model is single-user macOS; do not use this for distribution to others without a signed build.
 
+### What we already harden
+
+- **Argv-free secret transport** — the BitLocker password/recovery key goes to dislocker over an stdin pipe, never a CLI argument, so it's not visible via `ps aux`. (F1-01, F1-02, F1-03)
+- **Out-of-band secret file** — `--secret-file PATH --secret-type {password|recovery|bek}` routes the secret through a mode-0600, symlink-guarded temp file, unlinked before use. Legacy `--password`/`--recovery` flags still work for interactive use but emit a deprecation warning for the same `ps aux` exposure reason.
+- **In-memory zeroization** — the process's copy of the secret is zeroed as soon as possible after use. (F1-04)
+- **Screen-capture blocking** — the app sets `sharingType = .none` on its window, excluding the credential-entry UI from screenshots and screen recording. (F6-03)
+- **Plaintext-image cleanup** — the app intercepts quit and eject to delete the Path A decrypted image and unmount, so plaintext isn't left behind. (F1-06)
+- **Bundle integrity manifest** — `make-app.sh` writes a SHA-256 manifest of the `.app`; `verify-bundle.sh` checks it for post-build tampering. (F7-05)
+- **Supply-chain pinning** — the vendored dislocker submodule is pinned to a documented upstream commit SHA. (F7-03)
+- **Privilege boundary** — privileged (root) operations run through a dedicated helper, not the whole app as root.
+- **Kextless streaming** — Path B uses FUSE-T, a userspace FUSE implementation, deliberately avoiding kernel-extension approval and Apple Silicon recovery-loop issues.
+- **Bounded write risk** — Path A (default) only reads the source drive; it never writes back unless the user explicitly passes `--rw`.
+
+See the full review linked above for the complete finding list, severities, and remediation status.
+
 ### Plaintext image on disk
 
 Path A (`bl-open`, `bl unlock`, the app's default flow) writes a **fully decrypted, unencrypted** copy of the volume to `/private/tmp/bl/decrypted.img`. Treat that file as sensitive as the drive itself:

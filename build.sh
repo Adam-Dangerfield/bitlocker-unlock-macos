@@ -12,22 +12,19 @@
 #
 # ---------- VENDORED-COPY PIN POLICY ----------
 # third_party/dislocker is a vendored snapshot pinned to the commit recorded in
-# third_party/dislocker/COMMIT.txt (F7-03 remediation).  Any intentional update
+# third_party/dislocker.pin.md (F7-03 remediation).  Any intentional update
 # to that vendored copy requires:
 #   1. cd third_party/dislocker && git pull (or cherry-pick / reset)
 #   2. Manually review the diff for security-relevant changes.
-#   3. Re-run:
-#        SHA=$(git rev-parse HEAD)
-#        DESCRIBE=$(git describe --tags --always)
-#        printf 'Vendored at: %s\nTag/describe: %s\nDate pinned: %s\nReason: <your reason>\n' \
-#          "$SHA" "$DESCRIBE" "$(date +%Y-%m-%d)" \
-#          > COMMIT.txt
-#   4. Commit COMMIT.txt together with any source changes.
-# build.sh will REFUSE to build if the working-tree SHA does not match
-# COMMIT.txt.  This is intentional — drift must be a conscious change.
+#   3. Update the "Vendored at" SHA row in third_party/dislocker.pin.md to the
+#      new working-tree HEAD SHA (see the upgrade procedure in that file).
+#   4. Commit dislocker.pin.md together with any source changes.
+# build.sh will REFUSE to build if the working-tree SHA does not match the SHA
+# recorded in dislocker.pin.md.  This is intentional — drift must be a
+# conscious change.
 # ----------------------------------------------
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISLOCKER_DIR="$SCRIPT_DIR/third_party/dislocker"
@@ -147,19 +144,24 @@ PREFIX_PATH="$MBEDTLS_PREFIX"
 [[ -n "$FUSET_PREFIX" ]] && PREFIX_PATH="$PREFIX_PATH;$FUSET_PREFIX"
 
 # ---------- configure + build ----------
+# Log to unpredictable, per-invocation temp files (mktemp) rather than fixed
+# /tmp paths, to avoid symlink-clobbering and multi-user filename collisions.
+CMAKE_LOG="$(mktemp "${TMPDIR:-/tmp}/bl-cmake.XXXXXX.log")"
+BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/bl-build.XXXXXX.log")"
+
 mkdir -p "$DISLOCKER_DIR/build"
-cd "$DISLOCKER_DIR/build"
+cd "$DISLOCKER_DIR/build" || exit 1
 rm -f CMakeCache.txt
 cmake .. \
   -DWITH_FUSE="$WITH_FUSE" \
   -DWITH_RUBY=OFF \
   -DCMAKE_PREFIX_PATH="$PREFIX_PATH" \
-  > /tmp/bl-cmake.log 2>&1 \
-  || { echo "cmake configure failed. See /tmp/bl-cmake.log"; tail -20 /tmp/bl-cmake.log; exit 1; }
+  > "$CMAKE_LOG" 2>&1 \
+  || { echo "cmake configure failed. See $CMAKE_LOG"; tail -20 "$CMAKE_LOG"; exit 1; }
 
 cmake --build . -j \
-  > /tmp/bl-build.log 2>&1 \
-  || { echo "build failed. See /tmp/bl-build.log"; tail -30 /tmp/bl-build.log; exit 1; }
+  > "$BUILD_LOG" 2>&1 \
+  || { echo "build failed. See $BUILD_LOG"; tail -30 "$BUILD_LOG"; exit 1; }
 
 echo ""
 echo "Built binaries (third_party/dislocker/build/src/):"

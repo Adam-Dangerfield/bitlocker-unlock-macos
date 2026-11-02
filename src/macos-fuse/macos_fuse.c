@@ -72,6 +72,11 @@ bool bitlocker_mount_volume(const char *volume_path, const char *mount_point)
         return false;
     }
 
+    /* TODO(milestone-3): volume_path is not yet wired into the FUSE operations
+     * — the read/open handlers are still stubs (they return -ENOENT), so no
+     * data is ever decrypted from volume_path. Once the read path is
+     * implemented, the opened volume must be passed to bitlocker_ops via the
+     * private_data argument of fuse_main (currently NULL). */
     char *fuse_argv[] = {
         "bitlocker-mount",
         (char *)mount_point,
